@@ -1,0 +1,53 @@
+/** Pure TypeScript reconstruction. No compiler, VM, subprocess, or WASM is used here. */
+import { BocError, DecompilerError } from './errors.js';
+import { codeHash, methodCells } from './boc.js';
+import { disassembleProgram } from './disassembler.js';
+import { reconstruct, readableModule, render, renderParts } from './func.js';
+export function reconstructReadable(boc: Uint8Array) {
+  let originalHash: string;
+  try {
+    originalHash = codeHash(boc);
+  } catch (e) {
+    if (e instanceof BocError) throw new DecompilerError('INVALID_BOC', e.message, 'boc', 400);
+    throw e;
+  }
+  let program: ReturnType<typeof disassembleProgram>;
+  try {
+    program = disassembleProgram(boc);
+  } catch (e) {
+    throw new DecompilerError(
+      'UNSUPPORTED_DISPATCHER',
+      e instanceof Error ? e.message : String(e),
+      'disassembly',
+    );
+  }
+  const module = readableModule(reconstruct(program, methodCells(boc)));
+  const lifted = module.functions.filter((f) => !f.assembly).length;
+  return {
+    success: true as const,
+    func: render(module),
+    ...renderParts(module),
+    ...(lifted < module.functions.length
+      ? {
+          display_contract: renderParts(module, program).contract,
+          display_format: 'func-fift-pseudocode',
+        }
+      : {}),
+    decompilation: {
+      quality: 'unverified',
+      recompiles: false,
+      exact_hash_match: false,
+      verification_performed: false,
+      original_code_hash: originalHash,
+      reconstruction_mode:
+        lifted === module.functions.length ? 'structured' : lifted ? 'hybrid' : 'cell_assembly',
+      structured_method_count: lifted,
+      method_count: module.functions.length,
+      unsupported_instructions: module.unsupported,
+    },
+    diagnostics: [
+      ...module.diagnostics,
+      'Static TypeScript reconstruction only. Compilation and semantic equivalence have not been checked.',
+    ],
+  };
+}

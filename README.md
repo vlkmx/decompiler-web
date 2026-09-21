@@ -1,40 +1,52 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/pages/api-reference/create-next-app).
+# TON Decompiler · Next.js
 
-## Getting Started
+Страница и API для восстановления читаемого FunC из base64 BOC ячейки кода TON-контракта.
 
-First, run the development server:
+## Запуск
 
-```bash
+Требуется Node.js 22+.
+
+```sh
+npm ci
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Откройте http://localhost:3000. Сборка TypeScript-ядра запускается автоматически перед `dev` и `build`.
 
-You can start editing the page by modifying `pages/index.tsx`. The page auto-updates as you edit the file.
+```sh
+npm run build
+npm start
+```
 
-[API routes](https://nextjs.org/docs/pages/building-your-application/routing/api-routes) can be accessed on [http://localhost:3000/api/hello](http://localhost:3000/api/hello). This endpoint can be edited in `pages/api/hello.ts`.
+`engine/` — самостоятельная копия TypeScript-декомпилятора, подключённая как локальный пакет. Соседние проекты `decompiler` и `decompiler-node` для работы не нужны. После изменения ядра запустите `npm run build:engine` и перезапустите сервер.
 
-The `pages/api` directory is mapped to `/api/*`. Files in this directory are treated as [API routes](https://nextjs.org/docs/pages/building-your-application/routing/api-routes) instead of React pages.
+## API
 
-This project uses [`next/font`](https://nextjs.org/docs/pages/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```sh
+curl http://localhost:3000/api/decompile \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"<base64 BOC>","verify":true,"max_search_time_ms":30000}'
+```
 
-## Learn More
+- `code` — BOC ячейки кода (не аккаунта/StateInit), максимум 1 МиБ после декодирования.
+- `verify` — повторная компиляция через FunC/Fift WASM; по умолчанию `true`. При `false` работает статическое TS-восстановление без компилятора.
+- `max_search_time_ms` — бюджет 1–30000 мс, по умолчанию 30000.
+- `readable.contract` — читаемый контракт, `readable.stdlib` — помощники, `readable.func` — полный исходник. Если `readable` отсутствует, используйте поля верхнего уровня.
+- При включённой проверке верхний `func` сохраняет точный хэш и может содержать asm. Читаемый вариант проверяется отдельно; компиляция с другим хэшем не доказывает эквивалентность поведения.
+- При `verify: false` верхние поля содержат читаемый непроверенный результат.
 
-To learn more about Next.js, take a look at the following resources:
+Для компиляции нужен полный `.func`, а не только `.contract`. Кнопка скачивания на вкладке читаемого FunC сохраняет полный исходник с помощниками.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn-pages-router) - an interactive Next.js tutorial.
+Ошибки: 400 — некорректный вход, 405 — метод, 413 — размер, 415 — Content-Type, 422 — не удалось декомпилировать, 503 — все процессы заняты, 504 — таймаут.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Выполнение и ограничения
 
-## Deploy on Vercel
+API запускает отдельный Node-процесс на запрос, максимум четыре одновременно на экземпляр сервера. При отключении клиента или превышении времени процесс завершается. Компилятор выполняется в Worker Thread. TVM для исполнения контрактов, Python и Go не используются.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Развёртывание требует Node.js с поддержкой дочерних процессов и минимум 40 секунд на запрос; статический экспорт и Edge runtime не поддерживаются. При переносе готовой сборки нужны `engine/dist`, `engine/package.json` и установленные зависимости. Next file tracing настроен для API и WASM-компилятора. Heap-limit процесса не заменяет внешние ограничения общей памяти.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/pages/building-your-application/deploying) for more details.
+Высокоуровневое восстановление ещё не покрывает все конструкции Python-версии. Неподдержанные методы остаются в asm; интерфейс показывает число восстановленных методов.
+
+## Данные запросов
+
+API не скачивает контракты из сети и не сохраняет входной BOC или результат в файлы, базу данных, логи или кеш. Обработка выполняется в памяти отдельного процесса, который завершается после ответа. HTTP-ответы имеют `Cache-Control: no-store`. На странице данные живут только в состоянии React, без localStorage/sessionStorage. Скачивание файла происходит только при нажатии Download пользователем.
