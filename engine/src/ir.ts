@@ -31,6 +31,13 @@ export interface StackIR {
   statements: Statement[];
   primitives: Primitive[];
 }
+export interface PartialIR {
+  args: Expr[];
+  stack: Expr[];
+  statements: Statement[];
+  primitives: Primitive[];
+  remaining: Instruction[];
+}
 export const expr = (op: string, value = '', type = 'int', args: Expr[] = []): Expr => ({
   op,
   value,
@@ -102,6 +109,7 @@ export function analyze(
     hints?: string[];
     methods?: Map<number, StackIR> | ((id: number) => StackIR);
     globalTypes?: Map<number, string>;
+    onPartial?: (partial: PartialIR) => void;
   } = {},
 ): StackIR {
   if (options.arguments === undefined) {
@@ -241,7 +249,16 @@ export function analyze(
       );
       stack.push(...results);
     }
+    // A preview may stop only at a boundary with no pending static continuations.
+    // Keep it separate from executable IR: the remaining stack effect is unknown.
+    let boundary = 0, boundaryBody = 0, boundaryStack = [...stack];
+    try {
     for (let index = 0; index < code.length; index++) {
+      if (!pending.length) {
+        boundary = index;
+        boundaryBody = body.length;
+        boundaryStack = [...stack];
+      }
       if (++steps > 100_000)
         throw new UnsupportedInstruction('complexity', 'Symbolic execution limit');
       const i = code[index],
@@ -263,6 +280,43 @@ export function analyze(
           return Number(m[1] ?? m[2]);
         });
       if (op === 'NOP') continue;
+      if (op === 'PREPAREDICT' && /^CALLXARGS(?:_1)?$/.test(code[index + 1]?.opcode ?? '')) {
+        if (pending.length) throw new UnsupportedInstruction(op, 'Mixed static and dynamic continuations');
+        const [passed, returned] = code[index + 1].operands.map(Number);
+        // PREPAREDICT adds the method ID to the arguments supplied to c3.
+        // Preserve the runtime dispatcher (it may have been replaced by BLESS).
+        if (!Number.isInteger(passed) || passed < 1 || passed > 15 || returned !== 0)
+          throw new UnsupportedInstruction(op, 'Continuation call has an unresolved return signature');
+        const id = number();
+        primitive('CALL_PREPARED', Array.from({ length: passed - 1 }, (_, n) => `X${n}`), [],
+          `${id} PREPAREDICT ${passed} 0 CALLXARGS`, `_${id}_${passed}`);
+        index++;
+        continue;
+      }
+      if (/^CALLXARGS(?:_1)?$/.test(op) && !pending.length) {
+        const [passed, returned] = i.operands.map(Number);
+        if (!Number.isInteger(passed) || passed < 0 || passed > 15 || returned !== 0)
+          throw new UnsupportedInstruction(op, 'Continuation call has an unresolved return signature');
+        primitive('CALL_CONTINUATION', [...Array.from({ length: passed }, (_, n) => `X${n}`), 'cont'], [],
+          `${passed} 0 CALLXARGS`, `_${passed}`);
+        continue;
+      }
+      if (op === 'BLESS') {
+        if (pending.length) throw new UnsupportedInstruction(op, 'Mixed static and dynamic continuations');
+        primitive('BLESS', ['slice'], ['cont']);
+        continue;
+      }
+      if ((op === 'PUSH' || op === 'POP') && i.operands[0] === 'c3') {
+        if (pending.length) throw new UnsupportedInstruction(op, 'Mixed static and dynamic continuations');
+        primitive(op === 'PUSH' ? 'GETC3' : 'SETC3', op === 'POP' ? ['cont'] : [],
+          op === 'PUSH' ? ['cont'] : [], `c3 ${op}`);
+        continue;
+      }
+      if (op === 'PUSH' && ['c5', 'c7'].includes(i.operands[0])) {
+        primitive('GET' + i.operands[0].toUpperCase(), [],
+          [i.operands[0] === 'c5' ? 'cell' : 'tuple'], `${i.operands[0]} PUSH`);
+        continue;
+      }
       if (op === 'GETGLOB' || op === 'SETGLOB') {
         const slotNumber = number();
         if (slotNumber < 1 || slotNumber > 31)
@@ -699,7 +753,7 @@ export function analyze(
       }
       if ((op === 'CALL' && i.blocks.length === 1) || op === 'EXECUTE') {
         const continuation = op === 'CALL' ? i.blocks[0] : pending.pop();
-        if (!continuation) throw new UnsupportedInstruction(op, 'Dynamic continuation');
+        if (!continuation) throw new UnsupportedInstruction(op, 'Dynamic continuation: runtime code and stack signature are unknown');
         const r = execute(continuation, stack, depth + 1, true);
         body.push(...r.body);
         if (r.terminal) return { body, terminal: true };
@@ -1148,6 +1202,12 @@ export function analyze(
     }
     if (pending.length)
       throw new UnsupportedInstruction('continuation', 'Unused continuation value');
+    } catch (error) {
+      if (depth === 0 && error instanceof UnsupportedInstruction && boundaryBody > 0)
+        options.onPartial?.({ args, stack: boundaryStack, statements: body.slice(0, boundaryBody),
+          primitives: [...primitives.values()], remaining: code.slice(boundary) });
+      throw error;
+    }
     return { body, terminal: false };
   }
   const stack = [...args],

@@ -34,6 +34,7 @@ curl http://localhost:3000/api/decompile \
 - `readable.contract` — the readable contract; `readable.stdlib` — helper definitions; `readable.func` — the complete source. If `readable` is absent, use the top-level fields.
 - With verification enabled, the top-level `func` preserves the exact code hash and may contain assembly. The readable version is checked separately; compilation with a different hash does not establish behavioral equivalence.
 - With `verify: false`, the top-level fields contain the readable, unverified result.
+- Hybrid results also provide `display_contract` and `display_stdlib`: a non-compilable FunC/TVM preview with recovered prefixes, the stack at each unresolved boundary, and the remaining instructions. The web page shows this preview; downloading the contract still saves the complete executable FunC source with original method cells preserved.
 
 Compilation requires the complete `.func`, not just `.contract`. The download button on the readable FunC tab saves the complete source, including helpers.
 
@@ -46,6 +47,8 @@ The API starts a separate Node.js process for each request, with up to four conc
 Deployment requires Node.js with child-process support and a request timeout of at least 40 seconds. Static export and the Edge runtime are not supported. Deploying a prebuilt application requires `engine/dist`, `engine/package.json`, and installed dependencies. Next.js file tracing is configured for the API and WASM compiler. The per-process heap limit does not replace external limits on total memory usage.
 
 High-level reconstruction covers all Python-supported cases in the current parity suite, including typed global state, vectors and lists, dictionaries, loops, nested continuation returns, and Wallet V5. This is measured coverage, not a guarantee for arbitrary TVM programs. Unsupported methods remain in assembly; the interface shows how many original methods were recovered. Private continuation helpers are excluded from method counts.
+
+Runtime continuations support `BLESS`, reading/writing `c3`, and explicit `CALLXARGS p,0` calls through typed assembly helpers. `PREPAREDICT` calls retain the runtime dispatcher, including a replaced `c3`. Calls with unknown return signatures (`EXECUTE`) and captured exception handlers (`SETCONTCTR` / `TRY`) remain unresolved; their readable prefixes appear in the preview and do not count as fully recovered methods. The dynamic contract fixture currently recovers 14 of 18 methods fully and previews the remaining four.
 
 `GETGLOB` / `SETGLOB` are supported with type inference from assignments, including assignments before calls to other methods. `GETGLOB ISNULL` checks work without a previously established type. Run `npm test` for standalone regression tests, including recovery and API compilation of all six methods in the NFT contract fixture, TVM comparisons for collections and control flow, and Wallet V5 transactions that check signatures, persistent data and actions.
 

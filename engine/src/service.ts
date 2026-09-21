@@ -164,6 +164,7 @@ export async function decompile(boc: Uint8Array, options: DecompileOptions = {})
       ...(mode !== 'structured'
         ? {
             display_contract: renderParts(c.module, program).contract,
+            display_stdlib: renderParts(c.module, program).stdlib,
             display_format: 'func-fift-pseudocode',
           }
         : {}),
@@ -177,6 +178,7 @@ export async function decompile(boc: Uint8Array, options: DecompileOptions = {})
         reconstruction_mode: mode,
         stack_analysis_complete: mode === 'structured',
         structured_method_count: lifted,
+        partial_method_count: c.module.functions.filter((f) => !f.helper && f.assembly && f.partial).length,
         method_count: c.module.functions.filter((f) => !f.helper).length,
         unsupported_instructions: structured.unsupported,
         ...compare(asm, c.compiled.asm),

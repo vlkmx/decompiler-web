@@ -31,6 +31,7 @@ export function reconstructReadable(boc: Uint8Array) {
     ...(lifted < methods.length
       ? {
           display_contract: renderParts(module, program).contract,
+          display_stdlib: renderParts(module, program).stdlib,
           display_format: 'func-fift-pseudocode',
         }
       : {}),
@@ -43,6 +44,7 @@ export function reconstructReadable(boc: Uint8Array) {
       reconstruction_mode:
         lifted === methods.length ? 'structured' : lifted ? 'hybrid' : 'cell_assembly',
       structured_method_count: lifted,
+      partial_method_count: methods.filter((f) => f.assembly && f.partial).length,
       method_count: methods.length,
       unsupported_instructions: module.unsupported,
     },

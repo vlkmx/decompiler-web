@@ -6,8 +6,11 @@ type View = {
   func: string;
   contract: string;
   stdlib: string;
+  display_contract?: string;
+  display_stdlib?: string;
   decompilation: {
     structured_method_count: number;
+    partial_method_count?: number;
     method_count: number;
     exact_hash_match: boolean;
     recompiles: boolean;
@@ -41,7 +44,9 @@ export default function Home() {
         ? JSON.stringify(result, null, 2)
         : tab === "exact"
           ? result.func
-          : view[tab]
+          : tab === "contract"
+            ? view.display_contract ?? view.contract
+            : view.display_stdlib ?? view.stdlib
       : "";
 
   async function decompile() {
@@ -209,9 +214,13 @@ export default function Home() {
               <span className={styles.badge}>
                 {shown!.decompilation.structured_method_count} /{" "}
                 {shown!.decompilation.method_count} methods in FunC
+                {!!shown!.decompilation.partial_method_count &&
+                  ` · ${shown!.decompilation.partial_method_count} partial`}
               </span>
             </div>
             <p className={styles.notice}>
+              {tab === "contract" && view.display_contract &&
+                "Partial preview: readable prefixes and unresolved TVM instructions. Download saves the complete FunC source with preserved bytecode. "}
               {shown!.decompilation.exact_hash_match
                 ? "Recompiled successfully. The code hash matches the original."
                 : shown!.decompilation.recompiles
@@ -229,7 +238,7 @@ export default function Home() {
               >
                 {(
                   [
-                    ["contract", "Readable FunC"],
+                    ["contract", view?.display_contract ? "FunC + TVM preview" : "Readable FunC"],
                     ["stdlib", "Helpers"],
                     ...(result.decompilation.exact_hash_match
                       ? [["exact", "Exact source"]]
@@ -254,7 +263,7 @@ export default function Home() {
                 <button onClick={copy}>
                   {copied ? "Copied" : "Copy"}
                 </button>
-                <button onClick={download}>Download ↓</button>
+                <button onClick={download}>{tab === "contract" && view.display_contract ? "Download FunC ↓" : "Download ↓"}</button>
               </div>
             </div>
             <pre className={styles.code} role="tabpanel" tabIndex={0}>

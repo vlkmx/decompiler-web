@@ -9,6 +9,7 @@ import {
   type Statement,
   type Primitive,
   type StackIR,
+  type PartialIR,
 } from './ir.js';
 import { UnsupportedInstruction } from './errors.js';
 export interface FunctionAst {
@@ -20,6 +21,7 @@ export interface FunctionAst {
   assembly?: string[];
   diagnostic?: string;
   helper?: boolean;
+  partial?: PartialIR;
 }
 export interface Module {
   functions: FunctionAst[];
@@ -120,6 +122,7 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
   const methods = new Map([...program.methods].map(([id, code]) => [id, staticCalls(code)]));
   for (const [id, code] of helperCode) methods.set(id, code);
   const irs = new Map<number, StackIR>(),
+    partials = new Map<number, PartialIR>(),
     globalTypes = new Map<number, string>(),
     failures = new Map<number, UnsupportedInstruction>(),
     active = new Set<number>();
@@ -144,7 +147,8 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
               : undefined;
       // Resolve calls at their instruction position, after preceding SETGLOBs
       // have established types used by the callee (as in the Python engine).
-      const result = analyze(code, { methods: lift, hints, globalTypes });
+      const result = analyze(code, { methods: lift, hints, globalTypes,
+        onPartial: (partial) => partials.set(id, partial) });
       // FunC assigns IDs to private functions starting at 1. For contracts
       // exporting those IDs, inline helper IR rather than creating collisions.
       if (
@@ -239,7 +243,7 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
       if (!(e instanceof UnsupportedInstruction) || !fallback) throw e;
       diagnostics.push(`Method ${id}: ${e.message}`);
       unsupported.push(e.opcode);
-      functions.push({ ...fallback.get(id)!, diagnostic: e.message });
+      functions.push({ ...fallback.get(id)!, diagnostic: e.message, partial: partials.get(id) });
     }
   }
   // Only emit helpers actually reached by successfully analyzed methods.
@@ -455,6 +459,8 @@ export function renderParts(
   const values = module.functions.flatMap((f) => [
     ...f.returns.flatMap((e) => [...expressions(e)]),
     ...allValues(f.statements),
+    ...(display && f.partial ? [...allValues(f.partial.statements),
+      ...f.partial.stack.flatMap((e) => [...expressions(e)])] : []),
   ]);
   const calls = new Set(values.filter((e) => e.op === 'call').map((e) => e.value));
   const modifying = new Set(values.filter((e) => e.op === 'modify').map((e) => e.value));
@@ -466,7 +472,10 @@ export function renderParts(
     module.functions.some((f) => hasNullDeclaration(f.statements))
   )
     helpers.push('forall X -> X null() asm "PUSHNULL";');
-  for (const p of module.primitives) {
+  const visiblePrimitives = new Map(module.primitives.map((p) => [p.name, p]));
+  if (display) for (const f of module.functions)
+    for (const p of f.partial?.primitives ?? []) visiblePrimitives.set(p.name, p);
+  for (const p of visiblePrimitives.values()) {
     const generic = [...new Set([...p.inputs, ...p.outputs].filter((t) => /^X\d*$/.test(t)))];
     const prefix = generic.length ? 'forall ' + generic.join(', ') + ' -> ' : '';
     const args = p.inputs.map((t, i) => `${sourceType(t)} arg${i}`).join(', ');
@@ -508,6 +517,19 @@ export function renderParts(
       ' impure' +
       (f.helper ? ' inline_ref' : [0, -1, -2].includes(f.id) ? '' : ` method_id(${f.id})`);
     if (f.assembly && display) {
+      if (f.partial) {
+        const p = f.partial;
+        lines.push(
+          `;; Partial reconstruction only; full method bytecode is preserved in the executable output.`,
+          `;; ${f.diagnostic?.replace(/[\r\n]/g, ' ')}`,
+          `${f.name}(${['...stack', ...p.args.map((a) => `${a.type === 'unknown' ? 'var' : sourceType(a.type)} ${a.value}`)].join(', ')})${attributes} {`,
+          ...statements(p.statements),
+          `  ;; Stack at the unresolved boundary, bottom to top (untouched lower values omitted):`,
+          `  ;; ${p.stack.map(expression).join(', ') || '(empty)'}`,
+          '  fift {', formatAsm(p.remaining, '    '), '  }', '}', '',
+        );
+        continue;
+      }
       lines.push(
         `${f.name}(${args})${attributes} fift {`,
         formatAsm(display.methods.get(f.id) ?? [], '  '),
