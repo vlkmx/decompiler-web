@@ -107,7 +107,10 @@ export function analyze(
   options: {
     arguments?: number;
     hints?: string[];
-    methods?: Map<number, StackIR> | ((id: number) => StackIR);
+    // Unlike entrypoint hints, caller hints do not bound inferred stack depth.
+    // The caller may itself still be discovering its arguments.
+    argumentHints?: string[];
+    methods?: Map<number, StackIR> | ((id: number, hints?: string[]) => StackIR);
     globalTypes?: Map<number, string>;
     onPartial?: (partial: PartialIR) => void;
   } = {},
@@ -129,8 +132,9 @@ export function analyze(
       'entrypoint',
       'Inferred arguments exceed entrypoint signature',
     );
+  const hints = options.hints ?? options.argumentHints;
   const args = Array.from({ length: count }, (_, i) =>
-    expr('arg', `arg${i}`, options.hints?.slice(-count)[i] ?? 'unknown'),
+    expr('arg', `arg${i}`, hints?.[hints.length - count + i] ?? 'unknown'),
   );
   const primitives = new Map<string, Primitive>();
   let localCount = 0,
@@ -143,6 +147,15 @@ export function analyze(
     if (value.type === 'unknown' && value.op === 'arg') {
       value.type = type;
       return;
+    }
+    if (value.type.startsWith('[') && type.startsWith('[')) {
+      const actual = tupleTypes(value.type),
+        expected = tupleTypes(type);
+      if (actual.length === expected.length) {
+        actual.forEach((t, n) => requireType(expr('type', '', t), expected[n]));
+        value.type = type;
+        return;
+      }
     }
     if (value.type !== type)
       throw new UnsupportedInstruction(
@@ -762,7 +775,9 @@ export function analyze(
       if (op === 'CALLDICT' || op === 'JMPDICT') {
         const id = number(),
           callee =
-            typeof options.methods === 'function' ? options.methods(id) : options.methods?.get(id);
+            typeof options.methods === 'function'
+              ? options.methods(id, stack.map((v) => v.type))
+              : options.methods?.get(id);
         if (!callee)
           throw new UnsupportedInstruction(op, `Unknown or recursive method signature: ${id}`);
         const values = take(callee.arguments);

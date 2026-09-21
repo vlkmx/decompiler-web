@@ -129,9 +129,9 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
   const fallback = cells
     ? new Map(fallbackCells(program, cells).functions.map((f) => [f.id, f]))
     : undefined;
-  function lift(id: number): StackIR {
+  function lift(id: number, callerHints?: string[]): StackIR {
     if (irs.has(id)) return irs.get(id)!;
-    if (failures.has(id)) throw failures.get(id)!;
+    if (failures.has(id) && !callerHints) throw failures.get(id)!;
     if (active.has(id)) throw new UnsupportedInstruction('CALLDICT', 'Recursive method signature');
     const code = methods.get(id);
     if (!code) throw new UnsupportedInstruction('CALLDICT', `Missing method ${id}`);
@@ -147,8 +147,13 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
               : undefined;
       // Resolve calls at their instruction position, after preceding SETGLOBs
       // have established types used by the callee (as in the Python engine).
-      const result = analyze(code, { methods: lift, hints, globalTypes,
-        onPartial: (partial) => partials.set(id, partial) });
+      const result = analyze(code, {
+        methods: lift,
+        hints,
+        globalTypes,
+        argumentHints: callerHints?.map((type) => (type.startsWith('[') ? type : 'unknown')),
+        onPartial: (partial) => partials.set(id, partial),
+      });
       // FunC assigns IDs to private functions starting at 1. For contracts
       // exporting those IDs, inline helper IR rather than creating collisions.
       if (
@@ -215,6 +220,7 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
       }
       if (id === 0 || id === -1) result.returns = [];
       irs.set(id, result);
+      failures.delete(id);
       return result;
     } catch (e) {
       if (!(e instanceof UnsupportedInstruction)) throw e;
@@ -228,6 +234,20 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
     primitives = new Map<string, Primitive>(),
     diagnostics: string[] = [],
     unsupported: string[] = [];
+  // A later caller can supply tuple shapes and initialize globals that were
+  // unavailable on the first visit. Finish discovery before emitting fallbacks.
+  for (let pass = 0; pass <= methods.size; pass++) {
+    const before = JSON.stringify([[...irs.keys()], [...globalTypes]]);
+    failures.clear();
+    for (const id of program.methods.keys()) {
+      try {
+        lift(id);
+      } catch (error) {
+        if (!(error instanceof UnsupportedInstruction)) throw error;
+      }
+    }
+    if (before === JSON.stringify([[...irs.keys()], [...globalTypes]])) break;
+  }
   for (const [id] of [...program.methods].sort(([a], [b]) => a - b)) {
     try {
       const ir = lift(id);
@@ -437,11 +457,13 @@ function* allValues(body: Statement[]): Generator<Expr> {
   }
 }
 const sourceType = (type: string): string =>
-  type.startsWith('list_') || type.startsWith('vector_')
-    ? 'tuple'
-    : type.startsWith('[')
-      ? '[' + tupleTypes(type).map(sourceType).join(', ') + ']'
-      : type;
+  type === 'null'
+    ? 'cell'
+    : type.startsWith('list_') || type.startsWith('vector_')
+      ? 'tuple'
+      : type.startsWith('[')
+        ? '[' + tupleTypes(type).map(sourceType).join(', ') + ']'
+        : type;
 const signature = (types: string[]) =>
   types.length === 1 ? sourceType(types[0]) : `(${types.map(sourceType).join(', ')})`;
 function hasNullDeclaration(body: Statement[]): boolean {
@@ -450,6 +472,13 @@ function hasNullDeclaration(body: Statement[]): boolean {
       (s.kind === 'declare' && s.values[0].type !== 'int') ||
       hasNullDeclaration(s.then) ||
       hasNullDeclaration(s.otherwise),
+  );
+}
+function terminates(body: Statement[]): boolean {
+  const last = body.at(-1);
+  return !!last && (
+    last.kind === 'throw' || last.kind === 'return' ||
+    (last.kind === 'if' && terminates(last.then) && terminates(last.otherwise))
   );
 }
 export function renderParts(
@@ -469,6 +498,7 @@ export function renderParts(
   const chainNames = new Set<string>();
   if (
     values.some((e) => e.value === 'null()') ||
+    module.functions.some((f) => f.returns.length > 0 && terminates(f.statements)) ||
     module.functions.some((f) => hasNullDeclaration(f.statements))
   )
     helpers.push('forall X -> X null() asm "PUSHNULL";');
@@ -551,7 +581,11 @@ export function renderParts(
       lines.push(
         `${prefix}${result} ${f.name}(${args})${attributes} {`,
         ...statements(f.statements),
-        `  return ${f.returns.length === 1 ? formattedExpression(f.returns[0], 2) : '(' + f.returns.map(expression).join(', ') + ')'};`,
+        // FunC still checks the unreachable end after throw(). Do not reference
+        // an early-return value declared inside a branch or loop here.
+        `  return ${terminates(f.statements)
+          ? (f.returns.length === 1 ? 'null()' : '(' + f.returns.map(() => 'null()').join(', ') + ')')
+          : f.returns.length === 1 ? formattedExpression(f.returns[0], 2) : '(' + f.returns.map(expression).join(', ') + ')'};`,
         '}',
         '',
       );

@@ -52,6 +52,8 @@ Runtime continuations support `BLESS`, reading/writing `c3`, and explicit `CALLX
 
 `GETGLOB` / `SETGLOB` are supported with type inference from assignments, including assignments before calls to other methods. `GETGLOB ISNULL` checks work without a previously established type. Run `npm test` for standalone regression tests, including recovery and API compilation of all six methods in the NFT contract fixture, TVM comparisons for collections and control flow, and Wallet V5 transactions that check signatures, persistent data and actions.
 
+Tuple argument shapes propagate from callers to callees. Methods that initially fail type inference are retried as global types and call signatures become available; nullable tuple fields are checked recursively. The 26-method `user-contract-3` fixture recovers 23 methods completely and one partially. Its entrypoint still requires captured continuation support, and methods 71 and 72 lack sufficient tuple type information.
+
 ## Request data
 
 The API does not fetch contracts from the network or save the input BOC or result to files, databases, logs, or caches. Processing takes place in memory in a separate process that terminates after the response. HTTP responses include `Cache-Control: no-store`. On the page, data is held only in React state, without localStorage or sessionStorage. Files are downloaded only when the user clicks Download.
