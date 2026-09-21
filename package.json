@@ -8,15 +8,19 @@
     "start": "next start",
     "build:engine": "tsc -p engine/tsconfig.json",
     "predev": "npm run build:engine",
-    "prebuild": "npm run build:engine"
+    "prebuild": "npm run build:engine",
+    "test": "npm run build:engine && node --test engine/tests/*.test.mjs",
+    "audit:parity": "npm run build:engine && node scripts/audit-parity.mjs",
+    "test:parity": "npm run audit:parity -- --check"
   },
   "dependencies": {
+    "@local/ton-decompiler": "file:./engine",
     "next": "16.3.5",
     "react": "19.2.8",
-    "react-dom": "19.2.8",
-    "@local/ton-decompiler": "file:./engine"
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@ton/sandbox": "^0.42.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

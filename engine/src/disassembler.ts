@@ -67,7 +67,8 @@ function convert(items: runtime.Instr[], depth = 0): Instruction[] {
     if (name === 'PUSHCTR' || name === 'POPCTR') {
       name = name.slice(0, -3);
       operands[0] = 'c' + operands[0];
-    } else if (
+    } else if (name === 'SAVECTR') operands[0] = 'c' + operands[0];
+    else if (
       [
         'PUSH',
         'POP',
@@ -95,6 +96,7 @@ function convert(items: runtime.Instr[], depth = 0): Instruction[] {
       name = 'XCHG';
       operands.splice(0, operands.length, ...operands.map((x) => 's' + x));
     }
+    if (/^(MULRSHIFT[RC]?|RSHIFT[RC]|MODPOW2)_$/.test(name)) name = name.slice(0, -1) + '#';
     const aliases: Record<string, string> = {
       DROP2: '2DROP',
       DUP2: '2DUP',

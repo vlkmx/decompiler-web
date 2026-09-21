@@ -84,10 +84,11 @@ export async function decompile(boc: Uint8Array, options: DecompileOptions = {})
       if (remaining() <= 0 || attempts >= 64) break;
       try {
         const candidate = await evaluate(module, config),
-          lifted = module.functions.filter((f) => !f.assembly).length;
+          lifted = module.functions.filter((f) => !f.helper && !f.assembly).length;
         if (
           lifted &&
-          (!readable || lifted > readable.module.functions.filter((f) => !f.assembly).length)
+          (!readable ||
+            lifted > readable.module.functions.filter((f) => !f.helper && !f.assembly).length)
         )
           readable = candidate;
         if (candidate.exact) {
@@ -101,7 +102,8 @@ export async function decompile(boc: Uint8Array, options: DecompileOptions = {})
           const repaired = {
             ...module,
             functions: module.functions.map((f) =>
-              !rebuilt.has(f.id) || codeHash(rebuilt.get(f.id)!) !== codeHash(cells.get(f.id)!)
+              !f.helper &&
+              (!rebuilt.has(f.id) || codeHash(rebuilt.get(f.id)!) !== codeHash(cells.get(f.id)!))
                 ? {
                     ...f,
                     assembly: fallback.functions.find((x) => x.id === f.id)!.assembly,
@@ -149,9 +151,13 @@ export async function decompile(boc: Uint8Array, options: DecompileOptions = {})
     }
   }
   const view = (c: Candidate) => {
-    const lifted = c.module.functions.filter((f) => !f.assembly).length,
+    const lifted = c.module.functions.filter((f) => !f.helper && !f.assembly).length,
       mode =
-        lifted === c.module.functions.length ? 'structured' : lifted ? 'hybrid' : 'cell_assembly';
+        lifted === c.module.functions.filter((f) => !f.helper).length
+          ? 'structured'
+          : lifted
+            ? 'hybrid'
+            : 'cell_assembly';
     return {
       func: c.source,
       ...renderParts(c.module),
@@ -171,7 +177,7 @@ export async function decompile(boc: Uint8Array, options: DecompileOptions = {})
         reconstruction_mode: mode,
         stack_analysis_complete: mode === 'structured',
         structured_method_count: lifted,
-        method_count: c.module.functions.length,
+        method_count: c.module.functions.filter((f) => !f.helper).length,
         unsupported_instructions: structured.unsupported,
         ...compare(asm, c.compiled.asm),
         cell_match: compareCells(boc, c.compiled.boc),

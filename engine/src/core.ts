@@ -22,12 +22,13 @@ export function reconstructReadable(boc: Uint8Array) {
     );
   }
   const module = readableModule(reconstruct(program, methodCells(boc)));
-  const lifted = module.functions.filter((f) => !f.assembly).length;
+  const methods = module.functions.filter((f) => !f.helper);
+  const lifted = methods.filter((f) => !f.assembly).length;
   return {
     success: true as const,
     func: render(module),
     ...renderParts(module),
-    ...(lifted < module.functions.length
+    ...(lifted < methods.length
       ? {
           display_contract: renderParts(module, program).contract,
           display_format: 'func-fift-pseudocode',
@@ -40,9 +41,9 @@ export function reconstructReadable(boc: Uint8Array) {
       verification_performed: false,
       original_code_hash: originalHash,
       reconstruction_mode:
-        lifted === module.functions.length ? 'structured' : lifted ? 'hybrid' : 'cell_assembly',
+        lifted === methods.length ? 'structured' : lifted ? 'hybrid' : 'cell_assembly',
       structured_method_count: lifted,
-      method_count: module.functions.length,
+      method_count: methods.length,
       unsupported_instructions: module.unsupported,
     },
     diagnostics: [

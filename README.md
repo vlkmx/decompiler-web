@@ -1,24 +1,24 @@
 # TON Decompiler · Next.js
 
-Страница и API для восстановления читаемого FunC из base64 BOC ячейки кода TON-контракта.
+A web interface and API for recovering readable FunC from a base64-encoded TON contract code-cell BOC.
 
-## Запуск
+## Getting started
 
-Требуется Node.js 22+.
+Requires Node.js 22+.
 
 ```sh
 npm ci
 npm run dev
 ```
 
-Откройте http://localhost:3000. Сборка TypeScript-ядра запускается автоматически перед `dev` и `build`.
+Open http://localhost:3000. The TypeScript engine builds automatically before `dev` and `build`.
 
 ```sh
 npm run build
 npm start
 ```
 
-`engine/` — самостоятельная копия TypeScript-декомпилятора, подключённая как локальный пакет. Соседние проекты `decompiler` и `decompiler-node` для работы не нужны. После изменения ядра запустите `npm run build:engine` и перезапустите сервер.
+`engine/` is a standalone copy of the TypeScript decompiler, installed as a local package. The neighboring `decompiler` and `decompiler-node` projects are not required. After changing the engine, run `npm run build:engine` and restart the server.
 
 ## API
 
@@ -28,25 +28,44 @@ curl http://localhost:3000/api/decompile \
   -d '{"code":"<base64 BOC>","verify":true,"max_search_time_ms":30000}'
 ```
 
-- `code` — BOC ячейки кода (не аккаунта/StateInit), максимум 1 МиБ после декодирования.
-- `verify` — повторная компиляция через FunC/Fift WASM; по умолчанию `true`. При `false` работает статическое TS-восстановление без компилятора.
-- `max_search_time_ms` — бюджет 1–30000 мс, по умолчанию 30000.
-- `readable.contract` — читаемый контракт, `readable.stdlib` — помощники, `readable.func` — полный исходник. Если `readable` отсутствует, используйте поля верхнего уровня.
-- При включённой проверке верхний `func` сохраняет точный хэш и может содержать asm. Читаемый вариант проверяется отдельно; компиляция с другим хэшем не доказывает эквивалентность поведения.
-- При `verify: false` верхние поля содержат читаемый непроверенный результат.
+- `code` — a code-cell BOC (not an account or StateInit), up to 1 MiB after decoding.
+- `verify` — recompile using FunC/Fift WASM; defaults to `true`. When `false`, uses static TypeScript reconstruction without a compiler.
+- `max_search_time_ms` — a time budget of 1–30000 ms; defaults to 30000.
+- `readable.contract` — the readable contract; `readable.stdlib` — helper definitions; `readable.func` — the complete source. If `readable` is absent, use the top-level fields.
+- With verification enabled, the top-level `func` preserves the exact code hash and may contain assembly. The readable version is checked separately; compilation with a different hash does not establish behavioral equivalence.
+- With `verify: false`, the top-level fields contain the readable, unverified result.
 
-Для компиляции нужен полный `.func`, а не только `.contract`. Кнопка скачивания на вкладке читаемого FunC сохраняет полный исходник с помощниками.
+Compilation requires the complete `.func`, not just `.contract`. The download button on the readable FunC tab saves the complete source, including helpers.
 
-Ошибки: 400 — некорректный вход, 405 — метод, 413 — размер, 415 — Content-Type, 422 — не удалось декомпилировать, 503 — все процессы заняты, 504 — таймаут.
+Errors: 400 — invalid input; 405 — method not allowed; 413 — payload too large; 415 — unsupported Content-Type; 422 — decompilation failed; 503 — all worker slots are busy; 504 — timeout.
 
-## Выполнение и ограничения
+## Execution and limitations
 
-API запускает отдельный Node-процесс на запрос, максимум четыре одновременно на экземпляр сервера. При отключении клиента или превышении времени процесс завершается. Компилятор выполняется в Worker Thread. TVM для исполнения контрактов, Python и Go не используются.
+The API starts a separate Node.js process for each request, with up to four concurrent processes per server instance. The process is terminated if the client disconnects or the deadline is exceeded. The compiler runs in a Worker Thread. Production decompilation does not execute contracts in TVM or use Python or Go. Development tests use a TVM emulator.
 
-Развёртывание требует Node.js с поддержкой дочерних процессов и минимум 40 секунд на запрос; статический экспорт и Edge runtime не поддерживаются. При переносе готовой сборки нужны `engine/dist`, `engine/package.json` и установленные зависимости. Next file tracing настроен для API и WASM-компилятора. Heap-limit процесса не заменяет внешние ограничения общей памяти.
+Deployment requires Node.js with child-process support and a request timeout of at least 40 seconds. Static export and the Edge runtime are not supported. Deploying a prebuilt application requires `engine/dist`, `engine/package.json`, and installed dependencies. Next.js file tracing is configured for the API and WASM compiler. The per-process heap limit does not replace external limits on total memory usage.
 
-Высокоуровневое восстановление ещё не покрывает все конструкции Python-версии. Неподдержанные методы остаются в asm; интерфейс показывает число восстановленных методов.
+High-level reconstruction covers all Python-supported cases in the current parity suite, including typed global state, vectors and lists, dictionaries, loops, nested continuation returns, and Wallet V5. This is measured coverage, not a guarantee for arbitrary TVM programs. Unsupported methods remain in assembly; the interface shows how many original methods were recovered. Private continuation helpers are excluded from method counts.
 
-## Данные запросов
+`GETGLOB` / `SETGLOB` are supported with type inference from assignments, including assignments before calls to other methods. `GETGLOB ISNULL` checks work without a previously established type. Run `npm test` for standalone regression tests, including recovery and API compilation of all six methods in the NFT contract fixture, TVM comparisons for collections and control flow, and Wallet V5 transactions that check signatures, persistent data and actions.
 
-API не скачивает контракты из сети и не сохраняет входной BOC или результат в файлы, базу данных, логи или кеш. Обработка выполняется в памяти отдельного процесса, который завершается после ответа. HTTP-ответы имеют `Cache-Control: no-store`. На странице данные живут только в состоянии React, без localStorage/sessionStorage. Скачивание файла происходит только при нажатии Download пользователем.
+## Request data
+
+The API does not fetch contracts from the network or save the input BOC or result to files, databases, logs, or caches. Processing takes place in memory in a separate process that terminates after the response. HTTP responses include `Cache-Control: no-store`. On the page, data is held only in React state, without localStorage or sessionStorage. Files are downloaded only when the user clicks Download.
+
+## Python parity audit
+
+Run the development audit to find missing features without checking contracts manually:
+
+```sh
+PYTHON=python3.12 npm run audit:parity
+PYTHON=python3.12 npm run test:parity
+```
+
+The audit requires Python 3.12+ and the reference repository at `../decompiler`; override its location with `PYTHON_DECOMPILER_ROOT`. Five BOC fixtures are included in `engine/tests/fixtures`, so the neighboring Node project is not needed. These dependencies are used only by the development audit, never by the web application.
+
+The audit extracts Python-supported instruction snippets and compilable FunC examples from the reference tests, adds parameterized probes, and compares reconstruction, compilation and sampled TVM execution. Successful return stacks and exception codes are compared for getter samples. Results are written to `reports/parity/REPORT.md` and `results.json`; set `PARITY_OUTPUT` to change the output directory. See [the porting results and limitations](reports/PARITY.md).
+
+`test:parity` fails on any Python-supported instruction or contract that the web engine cannot recover, sampled TVM mismatches, compilation failures, or regressions against `scripts/parity-baseline.json`. After reviewing intentional changes, update the baseline explicitly with `npm run audit:parity -- --update-baseline`. Keep the same reference checkout when comparing against a baseline. Baseline updates are refused if any parity check fails.
+
+The VM checks cover specific inputs and transactions; they are not a proof of equivalence for every input. Matching stack signatures or successful compilation alone cannot establish correctness. Historical compiler fingerprinting and the complete original development corpus are outside this suite.

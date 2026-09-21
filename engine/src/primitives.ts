@@ -1,5 +1,26 @@
 // Fixed TVM operand/result signatures ported from decompiler/ir.py.
 export const primitiveSignatures: Record<string, [string[], string[]]> = {
+  RANDU256: [[], ['int']],
+  SETGASLIMIT: [['int'], []],
+  SETRAND: [['int'], []],
+  BREMBITS: [['builder'], ['int']],
+  BREMREFS: [['builder'], ['int']],
+  PLDREFVAR: [['slice', 'int'], ['cell']],
+  DIVC: [['int', 'int'], ['int']],
+  DIVR: [['int', 'int'], ['int']],
+  DICTUADD: [
+    ['slice', 'int', 'cell', 'int'],
+    ['cell', 'int'],
+  ],
+  DICTIADD: [
+    ['slice', 'int', 'cell', 'int'],
+    ['cell', 'int'],
+  ],
+  SHA256U: [['slice'], ['int']],
+  SDSUBSTR: [['slice', 'int', 'int'], ['slice']],
+  INCOMINGVALUE: [[], ['[int, cell]']],
+  RIST255_VALIDATE: [['int'], []],
+  RIST255_MULBASE: [['int'], ['int']],
   STUX: [['int', 'builder', 'int'], ['builder']],
   STIX: [['int', 'builder', 'int'], ['builder']],
   DIVMOD: [

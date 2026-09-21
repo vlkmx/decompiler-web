@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { Cell } from '@ton/core';
 import { instruction, type Instruction } from './asm.js';
 import { UnsupportedInstruction } from './errors.js';
 import { primitiveSignatures } from './primitives.js';
@@ -22,6 +24,7 @@ export interface Primitive {
   assembly: string;
 }
 export interface StackIR {
+  inlineBody?: boolean;
   arguments: number;
   argumentTypes: string[];
   returns: Expr[];
@@ -59,6 +62,24 @@ export const binary: Record<string, string> = {
   LEQ: '<=',
   GEQ: '>=',
 };
+export function tupleTypes(type: string): string[] {
+  if (!type.startsWith('[') || !type.endsWith(']'))
+    throw new UnsupportedInstruction('type', 'Unknown tuple element types');
+  const parts: string[] = [];
+  let depth = 0,
+    start = 1;
+  for (let i = 1; i < type.length - 1; i++) {
+    if (type[i] === '[') depth++;
+    if (type[i] === ']') depth--;
+    if (type[i] === ',' && depth === 0) {
+      parts.push(type.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  if (start < type.length - 1) parts.push(type.slice(start, -1).trim());
+  return parts;
+}
+const typeKey = (type: string) => createHash('sha256').update(type).digest('hex').slice(0, 16);
 class StackUnderflow extends Error {}
 export function continuations(code: Instruction[]): Instruction[] {
   return code.flatMap((i) => {
@@ -76,7 +97,12 @@ export function continuations(code: Instruction[]): Instruction[] {
 }
 export function analyze(
   instructions: Instruction[],
-  options: { arguments?: number; hints?: string[]; methods?: Map<number, StackIR> } = {},
+  options: {
+    arguments?: number;
+    hints?: string[];
+    methods?: Map<number, StackIR> | ((id: number) => StackIR);
+    globalTypes?: Map<number, string>;
+  } = {},
 ): StackIR {
   if (options.arguments === undefined) {
     for (let count = 0; count <= 32; count++) {
@@ -89,6 +115,7 @@ export function analyze(
     throw new UnsupportedInstruction('stack', 'More than 32 inferred arguments');
   }
   const count = options.arguments;
+  const globalTypes = options.globalTypes ?? new Map<number, string>();
   if (options.hints && count > options.hints.length)
     throw new UnsupportedInstruction(
       'entrypoint',
@@ -103,6 +130,8 @@ export function analyze(
   const local = (type: string) => expr('local', `v${localCount++}`, type);
   function requireType(value: Expr, type: string) {
     if (type === 'X' || /^X\d+$/.test(type) || value.type === 'null') return;
+    if (value.type === 'vector_empty' && type.startsWith('vector_')) return;
+    if (type === 'tuple' && /^(vector_|list_|\[)/.test(value.type)) return;
     if (value.type === 'unknown' && value.op === 'arg') {
       value.type = type;
       return;
@@ -116,15 +145,52 @@ export function analyze(
   const product = (values: Expr[]) =>
     values.length === 1 ? values[0] : expr('product', '', '()', values);
   const same = (a: Expr, b: Expr) => a === b || JSON.stringify(a) === JSON.stringify(b);
+  // SAMEALTSAVE makes c1 the enclosing function return continuation.
+  let alternateReturn = false;
+  if (
+    instructions[0]?.opcode === 'SAVECTR' &&
+    ['c2', '2'].includes(instructions[0].operands[0]) &&
+    instructions[1]?.opcode === 'SAMEALTSAVE'
+  ) {
+    alternateReturn = true;
+    instructions = instructions.slice(2);
+  } else if (instructions[0]?.opcode === 'SAMEALTSAVE') {
+    alternateReturn = true;
+    instructions = instructions.slice(1);
+  }
   function execute(
     input: Instruction[],
     stack: Expr[],
     depth = 0,
+    localReturn = false,
   ): { body: Statement[]; terminal: boolean } {
     if (depth > 64)
       throw new UnsupportedInstruction('complexity', 'Symbolic continuation nesting limit');
-    const code = continuations(input),
-      body: Statement[] = [],
+    let code = continuations(input);
+    // A local return skips the rest of this continuation, not its caller.
+    // Make that tail the opposite branch so normal stack merging applies.
+    if (localReturn) {
+      for (let p = code.length - 1; p >= 0; p--) {
+        const op = code[p].opcode;
+        if (op === 'IFRET' || op === 'IFNOTRET') {
+          const tail = code.slice(p + 1);
+          code = [
+            ...code.slice(0, p),
+            ...continuations([instruction('IFELSE', [], op === 'IFRET' ? [[], tail] : [tail, []])]),
+          ];
+        } else if (['IFJMP', 'IFNOTJMP'].includes(op) && code[p - 1]?.opcode === 'PUSHCONT') {
+          const jump = code[p - 1].blocks[0],
+            tail = code.slice(p + 1);
+          code = [
+            ...code.slice(0, p - 1),
+            ...continuations([
+              instruction('IFELSE', [], op === 'IFJMP' ? [jump, tail] : [tail, jump]),
+            ]),
+          ];
+        }
+      }
+    }
+    const body: Statement[] = [],
       pending: Instruction[][] = [];
     const pop = (): Expr => {
       if (!stack.length) throw new StackUnderflow();
@@ -197,15 +263,56 @@ export function analyze(
           return Number(m[1] ?? m[2]);
         });
       if (op === 'NOP') continue;
-      if (op === 'IFRET' || op === 'IFNOTRET') {
-        if (depth !== 0)
-          throw new UnsupportedInstruction(op, 'Conditional return targets a nested continuation');
+      if (op === 'GETGLOB' || op === 'SETGLOB') {
+        const slotNumber = number();
+        if (slotNumber < 1 || slotNumber > 31)
+          throw new UnsupportedInstruction(op, 'Unsupported global slot');
+        if (op === 'GETGLOB' && code[index + 1]?.opcode === 'ISNULL') {
+          primitive(
+            'IS_GLOBAL_NULL',
+            [],
+            ['int'],
+            `${slotNumber} GETGLOB ISNULL`,
+            '_' + slotNumber,
+          );
+          index++;
+          continue;
+        }
+        let kind = globalTypes.get(slotNumber);
+        if (op === 'SETGLOB') {
+          const value = stack[stack.length - 1];
+          if (!value) throw new StackUnderflow();
+          if (!kind && value.type !== 'unknown' && value.type !== 'null') kind = value.type;
+          if (kind) {
+            requireType(value, kind);
+            globalTypes.set(slotNumber, kind);
+          }
+          primitive(op, ['X'], [], `${slotNumber} ${op}`, '_' + slotNumber);
+        } else {
+          if (!kind) throw new UnsupportedInstruction(op, 'Global value type is not established');
+          primitive(op, [], [kind], `${slotNumber} ${op}`, '_' + slotNumber);
+        }
+        continue;
+      }
+      if (op === 'RETALT') {
+        if (!alternateReturn)
+          throw new UnsupportedInstruction(op, 'Unknown alternate return target');
+        body.push(statement('return', [...stack]));
+        return { body, terminal: true };
+      }
+      if (['IFRET', 'IFNOTRET', 'IFRETALT', 'IFNOTRETALT'].includes(op)) {
+        if (op.endsWith('ALT') && !alternateReturn)
+          throw new UnsupportedInstruction(op, 'Unknown alternate return target');
         const condition = pop();
         requireType(condition, 'int');
         body.push(
           statement(
             'if',
-            [op === 'IFNOTRET' ? expr('binary', '==', 'int', [condition, literal(0)]) : condition],
+            [
+              op.startsWith('IFNOT')
+                ? expr('binary', '==', 'int', [condition, literal(0)])
+                : condition,
+            ],
             [statement('return', [...stack])],
           ),
         );
@@ -225,6 +332,54 @@ export function analyze(
         );
         continue;
       }
+      if (
+        ['MULRSHIFT#', 'MULRSHIFTR#', 'MULRSHIFTC#', 'RSHIFTR#', 'RSHIFTC#', 'MODPOW2#'].includes(
+          op,
+        )
+      ) {
+        const width = number();
+        if (width < 1 || width > 256) throw new UnsupportedInstruction(op, 'Invalid shift width');
+        primitive(
+          op.slice(0, -1),
+          op.startsWith('MUL') ? ['int', 'int'] : ['int'],
+          ['int'],
+          `${width} ${op}`,
+          '_' + width,
+        );
+        continue;
+      }
+      if (['STSLICECONST', 'SDBEGINS', 'SDBEGINSQ'].includes(op)) {
+        let prefix = i.operands[0];
+        if (i.operands.length !== 1) throw new UnsupportedInstruction(op, 'Missing slice literal');
+        if (/^(?:[a-f0-9]{2})+$/i.test(prefix)) {
+          const cell = Cell.fromBoc(Buffer.from(prefix, 'hex'))[0];
+          if (cell.refs.length) throw new UnsupportedInstruction(op, 'Referenced inline slice');
+          prefix = `x{${cell.bits.toString()}}`;
+        }
+        if (!/^x\{[a-f0-9]*_?\}$/i.test(prefix))
+          throw new UnsupportedInstruction(op, 'Invalid slice literal');
+        primitive(
+          op,
+          [op === 'STSLICECONST' ? 'builder' : 'slice'],
+          op === 'STSLICECONST' ? ['builder'] : op.endsWith('Q') ? ['slice', 'int'] : ['slice'],
+          `${prefix} ${op}`,
+          '_' + prefix.slice(2, -1),
+        );
+        continue;
+      }
+      if (['DICTUDELGET', 'DICTIDELGET', 'PFXDICTGETQ'].includes(op)) {
+        const padding = op === 'PFXDICTGETQ' ? 'NULLSWAPIFNOT2' : 'NULLSWAPIFNOT';
+        if (code[index + 1]?.opcode !== padding)
+          throw new UnsupportedInstruction(op, 'Dictionary operation needs padded results');
+        primitive(
+          op,
+          [op === 'PFXDICTGETQ' ? 'slice' : 'int', 'cell', 'int'],
+          op === 'PFXDICTGETQ' ? ['slice', 'slice', 'slice', 'int'] : ['cell', 'slice', 'int'],
+          `${op} ${padding}`,
+        );
+        index++;
+        continue;
+      }
       if (['DICTGET', 'DICTUGET', 'DICTIGET', 'DICTUGETREF', 'DICTIGETREF'].includes(op)) {
         if (code[index + 1]?.opcode !== 'NULLSWAPIFNOT')
           throw new UnsupportedInstruction(op, 'Dictionary lookup needs padded results');
@@ -239,7 +394,8 @@ export function analyze(
       }
       if (
         /^DICT[UI](?:(?:REM)?(?:MIN|MAX)|GET(?:NEXT|PREV)(?:EQ)?)$/.test(op) ||
-        op === 'DICTREMMIN'
+        op === 'DICTREMMIN' ||
+        op === 'DICTUMINREF'
       ) {
         if (code[index + 1]?.opcode !== 'NULLSWAPIFNOT2')
           throw new UnsupportedInstruction(op, 'Dictionary iteration needs padded results');
@@ -248,7 +404,7 @@ export function analyze(
           op.includes('GET') ? ['int', 'cell', 'int'] : ['cell', 'int'],
           [
             ...(op.includes('REM') ? ['cell'] : []),
-            'slice',
+            op === 'DICTUMINREF' ? 'cell' : 'slice',
             op === 'DICTREMMIN' ? 'slice' : 'int',
             'int',
           ],
@@ -332,7 +488,7 @@ export function analyze(
         stack.push(...v, v[0], v[1]);
         continue;
       }
-      if (op === 'ROT' || op === '-ROT') {
+      if (op === 'ROT' || op === '-ROT' || op === 'ROTREV') {
         const v = take(3);
         stack.push(...(op === 'ROT' ? [v[1], v[2], v[0]] : [v[2], v[0], v[1]]));
         continue;
@@ -497,6 +653,8 @@ export function analyze(
         continue;
       }
       const immediates: Record<string, string> = {
+        ADDCONST: '+',
+        MULCONST: '*',
         ADDINT: '+',
         MULINT: '*',
         EQINT: '==',
@@ -539,19 +697,48 @@ export function analyze(
         pending.push(i.blocks[0]);
         continue;
       }
-      if (op === 'CALL' && i.blocks.length === 1) {
-        const r = execute(i.blocks[0], stack, depth + 1);
+      if ((op === 'CALL' && i.blocks.length === 1) || op === 'EXECUTE') {
+        const continuation = op === 'CALL' ? i.blocks[0] : pending.pop();
+        if (!continuation) throw new UnsupportedInstruction(op, 'Dynamic continuation');
+        const r = execute(continuation, stack, depth + 1, true);
         body.push(...r.body);
         if (r.terminal) return { body, terminal: true };
         continue;
       }
       if (op === 'CALLDICT' || op === 'JMPDICT') {
         const id = number(),
-          callee = options.methods?.get(id);
+          callee =
+            typeof options.methods === 'function' ? options.methods(id) : options.methods?.get(id);
         if (!callee)
           throw new UnsupportedInstruction(op, `Unknown or recursive method signature: ${id}`);
         const values = take(callee.arguments);
         values.forEach((v, j) => requireType(v, callee.argumentTypes[j]));
+        if (callee.inlineBody) {
+          const locals = new Map<string, Expr>();
+          const substitute = (value: Expr): Expr => {
+            if (value.op === 'arg') return values[Number(value.value.slice(3))];
+            if (value.op === 'local') {
+              if (!locals.has(value.value)) locals.set(value.value, local(value.type));
+              return locals.get(value.value)!;
+            }
+            return { ...value, args: value.args.map(substitute) };
+          };
+          const rewrite = (s: Statement): Statement => ({
+            ...s,
+            values: s.values.map(substitute),
+            then: s.then.map(rewrite),
+            otherwise: s.otherwise.map(rewrite),
+          });
+          body.push(...callee.statements.map(rewrite));
+          callee.primitives.forEach((p) => primitives.set(p.name, p));
+          stack.push(...callee.returns.map(substitute));
+          if (op === 'JMPDICT') {
+            if (localReturn) return { body, terminal: false };
+            body.push(statement('return', [...stack]));
+            return { body, terminal: true };
+          }
+          continue;
+        }
         const results = callee.returns.map((v) => local(v.type)),
           call = expr('call', methodName(id), results[0]?.type ?? '()', values);
         body.push(
@@ -561,6 +748,7 @@ export function analyze(
         );
         stack.push(...results);
         if (op === 'JMPDICT') {
+          if (localReturn) return { body, terminal: false };
           body.push(statement('return', [...stack]));
           return { body, terminal: true };
         }
@@ -582,8 +770,18 @@ export function analyze(
           : cond;
         const left = [...stack],
           right = [...stack],
-          a = execute(branches[0], left, depth + 1),
-          b = execute(branches[1] ?? [], right, depth + 1);
+          a = execute(
+            branches[0],
+            left,
+            depth + 1,
+            localReturn || (!op.includes('JMP') && index !== code.length - 1),
+          ),
+          b = execute(
+            branches[1] ?? [],
+            right,
+            depth + 1,
+            localReturn || (!op.includes('JMP') && index !== code.length - 1),
+          );
         if (op.includes('JMP') && !a.terminal) {
           a.body.push(statement('return', [...left]));
           a.terminal = true;
@@ -615,7 +813,10 @@ export function analyze(
             merged.push(left[k]);
             continue;
           }
-          const kind = left[k].type === 'null' ? right[k].type : left[k].type;
+          const kind = ['null', 'unknown', 'vector_empty'].includes(left[k].type)
+            ? right[k].type
+            : left[k].type;
+          requireType(left[k], kind);
           requireType(right[k], kind);
           if (kind === 'unknown')
             throw new UnsupportedInstruction('type', 'Unknown branch result type');
@@ -634,166 +835,222 @@ export function analyze(
         stack.splice(0, stack.length, ...merged);
         continue;
       }
-      if (['REPEAT', 'UNTIL', 'WHILE'].includes(op)) {
-        const needed = op === 'WHILE' ? 2 : 1;
+      if (['REPEAT', 'UNTIL', 'WHILE', 'AGAINEND'].includes(op)) {
+        const needed = op === 'AGAINEND' ? 0 : op === 'WHILE' ? 2 : 1;
         if (pending.length < needed) throw new UnsupportedInstruction(op, 'Dynamic loop');
-        const parts = pending.splice(pending.length - needed, needed);
+        let parts =
+          op === 'AGAINEND'
+            ? [code.slice(index + 1)]
+            : pending.splice(pending.length - needed, needed);
+        let loopOp = op;
         const repeats = op === 'REPEAT' ? pop() : undefined;
         if (repeats) requireType(repeats, 'int');
-        // Infer types by probing once, then use mutable variables for loop-carried values.
-        const probe = [...stack];
-        const probeResult = execute(op === 'WHILE' ? parts[0] : parts[0], probe, depth + 1);
-        if (probeResult.terminal) throw new UnsupportedInstruction(op, 'Terminal loop probe');
-        if (op === 'WHILE') {
-          requireType(probe.pop()!, 'int');
-          execute(parts[1], probe, depth + 1);
+        if (
+          op === 'WHILE' &&
+          parts[0].length === 0 &&
+          stack.at(-1)?.op === 'literal' &&
+          /^-?\d+$/.test(stack.at(-1)!.value) &&
+          BigInt(stack.at(-1)!.value) !== 0n
+        ) {
+          pop();
+          loopOp = 'UNTIL';
+          parts = [[...parts[1], instruction('EQINT', ['0'])]];
         }
-        if (op === 'UNTIL') requireType(probe.pop()!, 'int');
-        if (probe.length !== stack.length)
-          throw new UnsupportedInstruction(op, 'Loop changes stack height');
-        const carried = stack.map((v, k) => {
-          if (v.type === 'unknown') requireType(v, probe[k].type);
-          if (v.type === 'null' && probe[k].type !== 'null') v = { ...v, type: probe[k].type };
-          if (v.type === 'unknown')
-            throw new UnsupportedInstruction(op, 'Unknown loop-carried type');
-          const t = local(v.type);
-          body.push(statement('assign', [t, v]));
-          return t;
-        });
-        const loopStack = [...carried];
-        let condition: Expr | undefined, loopBody: Statement[];
-        if (op === 'WHILE') {
-          const test = execute(parts[0], loopStack, depth + 1);
-          condition = loopStack.pop();
-          if (!condition) throw new StackUnderflow();
-          requireType(condition, 'int');
-          if (loopStack.length !== carried.length)
-            throw new UnsupportedInstruction(op, 'Condition changes stack height');
+        if (loopOp === 'WHILE') {
+          const probe = [...stack];
+          execute(parts[0], probe, depth + 1, true);
+        }
+        const probe = [...stack];
+        execute(loopOp === 'WHILE' ? parts[1] : parts[0], probe, depth + 1, true);
+        const carried = stack.map((value, k) => {
+          if (value.type === 'unknown' && probe[k] === value) return value;
+          let kind = value.type;
           if (
-            test.body.length === 1 &&
-            test.body[0].kind === 'assign' &&
-            test.body[0].values[0].op === 'local' &&
-            same(test.body[0].values[0], condition) &&
-            loopStack.every((v, k) => same(v, carried[k]))
-          ) {
-            const runStack = [...carried],
-              run = execute(parts[1], runStack, depth + 1);
-            if (run.terminal || runStack.length !== carried.length)
-              throw new UnsupportedInstruction(op, 'Unsupported loop body exit');
-            const changed = carried
-              .map((target, k) => ({ target, value: runStack[k] }))
-              .filter((pair) => !same(pair.target, pair.value));
-            let loopCondition = test.body[0].values[1];
-            if (loopCondition.op === 'call' && loopCondition.value === 'impure_touch')
-              loopCondition = loopCondition.args[0];
-            body.push(
-              statement(
-                'while',
-                [loopCondition],
-                [
-                  ...run.body,
-                  ...(changed.length
-                    ? [
-                        statement('set', [
-                          product(changed.map((p) => p.target)),
-                          product(changed.map((p) => p.value)),
-                        ]),
-                      ]
-                    : []),
-                ],
-              ),
-            );
-            stack.splice(0, stack.length, ...carried);
-            continue;
+            ['null', 'vector_empty'].includes(kind) &&
+            probe[k] &&
+            !['unknown', 'null'].includes(probe[k].type)
+          )
+            kind = probe[k].type;
+          if (kind === 'unknown') {
+            requireType(value, 'int');
+            kind = 'int';
           }
-          const condTarget = local('int');
-          body.push(
-            ...test.body,
-            statement('assign', [condTarget, condition]),
-            statement('set', [product(carried), product(loopStack)]),
-          );
-          const runStack = [...carried],
-            run = execute(parts[1], runStack, depth + 1);
-          if (run.terminal) throw new UnsupportedInstruction(op, 'Terminal loop body');
+          const target = local(kind);
+          body.push(statement('assign', [target, value]));
+          return target;
+        });
+        let condition: Expr = repeats ?? literal(-1),
+          testBody: Statement[] = [];
+        if (loopOp === 'WHILE') {
+          const testStack = [...carried],
+            test = execute(parts[0], testStack, depth + 1, true);
+          const flag = testStack.pop();
+          if (
+            !flag ||
+            test.terminal ||
+            testStack.length !== carried.length ||
+            testStack.some((v, k) => !same(v, carried[k]))
+          )
+            throw new UnsupportedInstruction(op, 'Condition changes carried stack');
+          requireType(flag, 'int');
+          condition = flag;
+          testBody = test.body;
+          if (
+            testBody.length === 1 &&
+            testBody[0].kind === 'assign' &&
+            same(testBody[0].values[0], flag)
+          ) {
+            condition = testBody[0].values[1];
+            testBody = [];
+          }
+        }
+        const runStack = [...carried],
+          run = execute(loopOp === 'WHILE' ? parts[1] : parts[0], runStack, depth + 1, true);
+        let loopBody = [...run.body];
+        if (loopOp === 'UNTIL') {
+          const flag = runStack.pop();
+          if (!flag) throw new StackUnderflow();
+          requireType(flag, 'int');
+          condition = local('int');
+          body.push(statement('declare', [condition]));
+          loopBody.push(statement('set', [condition, flag]));
+        }
+        if (!run.terminal) {
           if (runStack.length !== carried.length)
             throw new UnsupportedInstruction(op, 'Loop changes stack height');
-          const repeatStack = [...carried],
-            repeatTest = execute(parts[0], repeatStack, depth + 1),
-            repeatCondition = repeatStack.pop();
-          if (!repeatCondition || repeatStack.length !== carried.length)
-            throw new UnsupportedInstruction(op);
-          loopBody = [
-            ...run.body,
-            statement('set', [product(carried), product(runStack)]),
-            ...repeatTest.body,
-            statement('set', [condTarget, repeatCondition]),
-            statement('set', [product(carried), product(repeatStack)]),
-          ];
-          body.push(statement('while', [condTarget], loopBody));
-        } else {
-          const run = execute(parts[0], loopStack, depth + 1);
-          if (run.terminal) throw new UnsupportedInstruction(op, 'Terminal loop body');
-          condition = op === 'UNTIL' ? loopStack.pop() : repeats;
-          if (!condition) throw new StackUnderflow();
-          requireType(condition, 'int');
-          if (loopStack.length !== carried.length)
-            throw new UnsupportedInstruction(op, 'Loop changes stack height');
-          const condTarget = op === 'UNTIL' ? local('int') : undefined;
-          if (condTarget) body.push(statement('declare', [condTarget]));
-          loopBody = [
-            ...run.body,
-            ...(condTarget ? [statement('set', [condTarget, condition])] : []),
-            statement('set', [product(carried), product(loopStack)]),
-          ];
-          body.push(
-            statement(op === 'UNTIL' ? 'until' : 'repeat', [condTarget ?? condition], loopBody),
-          );
+          const changed = carried
+            .map((target, k) => ({ target, value: runStack[k] }))
+            .filter((p) => !same(p.target, p.value));
+          for (const { target, value } of changed) {
+            if (target.op !== 'local')
+              throw new UnsupportedInstruction(op, 'Loop changes an inferred invariant');
+            requireType(value, target.type);
+          }
+          if (changed.length)
+            loopBody.push(
+              statement('set', [
+                product(changed.map((p) => p.target)),
+                product(changed.map((p) => p.value)),
+              ]),
+            );
         }
+        if (loopOp === 'WHILE' && testBody.length) {
+          const flag = local('int');
+          body.push(statement('assign', [flag, literal(-1)]));
+          loopBody = [
+            ...testBody,
+            statement('set', [flag, condition]),
+            statement('if', [flag], loopBody),
+          ];
+          condition = flag;
+        }
+        body.push(
+          statement(loopOp === 'AGAINEND' ? 'while' : loopOp.toLowerCase(), [condition], loopBody),
+        );
         stack.splice(0, stack.length, ...carried);
+        if (loopOp === 'AGAINEND') return { body, terminal: true };
         continue;
       }
       if (op === 'TUPLE' || op === 'PAIR' || op === 'TRIPLE') {
         const n = op === 'PAIR' ? 2 : op === 'TRIPLE' ? 3 : number();
         if (n < 0 || n > 15) throw new UnsupportedInstruction(op);
+        if (n === 0) {
+          primitive('VECTOR_EMPTY', [], ['vector_empty'], '0 TUPLE');
+          continue;
+        }
         const values = take(n),
           types = values.map((v) => v.type);
         if (types.some((t) => t === 'unknown'))
           throw new UnsupportedInstruction(op, 'Unknown tuple element types');
         if (n === 2 && (types[1] === 'null' || types[1] === 'list_' + types[0])) {
           const kind = 'list_' + types[0],
-            name = 'tvm_cons_' + types[0].replace(/[^a-z0-9]/gi, '_');
+            name = 'tvm_cons_' + typeKey(types[0]);
           primitives.set(name, {
             name,
             inputs: [types[0], 'tuple'],
-            outputs: ['tuple'],
+            outputs: [kind],
             assembly: '2 TUPLE',
           });
           computed(expr('call', name, kind, values));
         } else computed(expr('tuple', '', '[' + types.join(', ') + ']', values));
         continue;
       }
+      if (op === 'TPUSH') {
+        const [vector, value] = take(2);
+        let kind = vector.type;
+        if (kind === 'vector_empty') {
+          if (['unknown', 'null'].includes(value.type))
+            throw new UnsupportedInstruction(op, 'Unknown vector element type');
+          kind = 'vector_' + value.type;
+        } else if (!kind.startsWith('vector_') || kind.slice(7) !== value.type)
+          throw new UnsupportedInstruction(op, 'Vector element type differs');
+        const name = 'tvm_tpush_' + typeKey(value.type);
+        primitives.set(name, {
+          name,
+          inputs: ['tuple', value.type],
+          outputs: [kind],
+          assembly: 'TPUSH',
+        });
+        computed(expr('call', name, kind, [vector, value]));
+        continue;
+      }
+      if (op === 'TLEN') {
+        const value = stack[stack.length - 1];
+        if (!value) throw new StackUnderflow();
+        if (value.type === 'vector_empty') {
+          pop();
+          stack.push(literal(0));
+        } else primitive(op, ['tuple'], ['int']);
+        continue;
+      }
+      if (op === 'TPOP' || op === 'INDEXVAR') {
+        const vector = stack[stack.length - (op === 'TPOP' ? 1 : 2)];
+        if (!vector) throw new StackUnderflow();
+        if (!vector.type.startsWith('vector_') || vector.type === 'vector_empty')
+          throw new UnsupportedInstruction(op, 'Unknown vector element type');
+        const element = vector.type.slice(7);
+        primitive(
+          op,
+          op === 'TPOP' ? [vector.type] : [vector.type, 'int'],
+          op === 'TPOP' ? [vector.type, element] : [element],
+          op,
+          '_' + typeKey(element),
+        );
+        continue;
+      }
       if (['INDEX', 'FIRST', 'SECOND', 'THIRD', 'UNTUPLE', 'UNPAIR'].includes(op)) {
         const value = stack[stack.length - 1];
         if (!value) throw new StackUnderflow();
-        if (!/^\[[a-z]+(?:, [a-z]+)*\]$/.test(value.type))
-          throw new UnsupportedInstruction(op, 'Unknown tuple element types');
-        const types = value.type.slice(1, -1).split(', '),
-          n =
-            op === 'FIRST'
-              ? 0
-              : op === 'SECOND'
-                ? 1
-                : op === 'THIRD'
+        const n =
+          op === 'FIRST'
+            ? 0
+            : op === 'SECOND'
+              ? 1
+              : op === 'THIRD'
+                ? 2
+                : op === 'UNPAIR'
                   ? 2
-                  : op === 'UNPAIR'
-                    ? 2
-                    : number();
+                  : number();
+        const list = value.type.startsWith('list_');
+        const types = list ? [value.type.slice(5), value.type] : tupleTypes(value.type);
         if (op === 'UNTUPLE' || op === 'UNPAIR') {
-          if (n !== types.length) throw new UnsupportedInstruction(op);
-          primitive('UNTUPLE', [value.type], types, `${n} UNTUPLE`, '_' + n);
+          if (n !== types.length) throw new UnsupportedInstruction(op, 'Tuple arity mismatch');
+          primitive(
+            'UNTUPLE',
+            [value.type],
+            types,
+            `${n} UNTUPLE`,
+            '_' + n + '_' + typeKey(value.type),
+          );
         } else {
-          if (!types[n]) throw new UnsupportedInstruction(op);
-          primitive('INDEX', [value.type], [types[n]], `${n} INDEX`, '_' + n);
+          if (!types[n]) throw new UnsupportedInstruction(op, 'Tuple index out of range');
+          primitive(
+            'INDEX',
+            [value.type],
+            [types[n]],
+            `${n} INDEX`,
+            '_' + n + '_' + typeKey(value.type),
+          );
         }
         continue;
       }

@@ -1,6 +1,8 @@
-import { type Program, type Instruction, walk, formatAsm } from './asm.js';
+import { type Program, type Instruction, formatAsm, walk, instruction } from './asm.js';
 import {
   analyze,
+  tupleTypes,
+  statement,
   expr,
   methodName,
   type Expr,
@@ -17,6 +19,7 @@ export interface FunctionAst {
   statements: Statement[];
   assembly?: string[];
   diagnostic?: string;
+  helper?: boolean;
 }
 export interface Module {
   functions: FunctionAst[];
@@ -61,7 +64,63 @@ export function fallbackCells(program: Program, cells: Map<number, Buffer>): Mod
 }
 export function reconstruct(program: Program, cells?: Map<number, Buffer>): Module {
   checkDispatcher(program);
+  const stableDispatcher = ![...program.methods.values()]
+    .flatMap((code) => [...walk(code)])
+    .some(
+      (i) =>
+        (i.opcode !== 'PUSH' && i.operands.includes('c3')) ||
+        /^(SETCONT|POPCTR|CALLCC|BLESS|TRY)/.test(i.opcode) ||
+        (i.opcode === 'POP' && i.operands.some((r) => ['c0', 'c1', 'c2'].includes(r))),
+    );
+  const helperCode = new Map<number, Instruction[]>(),
+    helperBodies = new Map<string, number>();
+  let nextHelper = Math.max(0, ...program.methods.keys()) + 1;
+  function staticCalls(code: Instruction[]): Instruction[] {
+    const result: Instruction[] = [];
+    for (let n = 0; n < code.length; n++) {
+      const i = code[n];
+      if (
+        stableDispatcher &&
+        i.opcode === 'PUSHINT' &&
+        code[n + 1]?.opcode === 'PUSH' &&
+        code[n + 1].operands[0] === 'c3' &&
+        code[n + 2]?.opcode === 'EXECUTE' &&
+        Number(i.operands[0]) > 0
+      ) {
+        result.push(instruction('CALLDICT', i.operands));
+        n += 2;
+      } else {
+        const block =
+          i.blocks.length === 1 &&
+          (i.opcode === 'CALL' || (i.opcode === 'PUSHCONT' && code[n + 1]?.opcode === 'EXECUTE'))
+            ? i.blocks[0]
+            : undefined;
+        // c1 scoped to a CALL cannot be represented as the caller's return.
+        // Keep such continuations as typed private inline_ref functions.
+        if (
+          block &&
+          (block[0]?.opcode === 'SAMEALTSAVE' ||
+            (block[0]?.opcode === 'SAVECTR' && block[1]?.opcode === 'SAMEALTSAVE'))
+        ) {
+          const nested = staticCalls(block),
+            key = JSON.stringify(nested);
+          let id = helperBodies.get(key);
+          if (id === undefined) {
+            id = nextHelper++;
+            helperBodies.set(key, id);
+            helperCode.set(id, nested);
+          }
+          result.push(instruction('CALLDICT', [String(id)]));
+          if (i.opcode === 'PUSHCONT') n++;
+        } else result.push({ ...i, blocks: i.blocks.map(staticCalls) });
+      }
+    }
+    return result;
+  }
+  const methods = new Map([...program.methods].map(([id, code]) => [id, staticCalls(code)]));
+  for (const [id, code] of helperCode) methods.set(id, code);
   const irs = new Map<number, StackIR>(),
+    globalTypes = new Map<number, string>(),
     failures = new Map<number, UnsupportedInstruction>(),
     active = new Set<number>();
   const fallback = cells
@@ -71,12 +130,10 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
     if (irs.has(id)) return irs.get(id)!;
     if (failures.has(id)) throw failures.get(id)!;
     if (active.has(id)) throw new UnsupportedInstruction('CALLDICT', 'Recursive method signature');
-    const code = program.methods.get(id);
+    const code = methods.get(id);
     if (!code) throw new UnsupportedInstruction('CALLDICT', `Missing method ${id}`);
     active.add(id);
     try {
-      for (const i of walk(code))
-        if (['CALLDICT', 'JMPDICT'].includes(i.opcode)) lift(Number(i.operands[0]));
       const hints =
         id === 0
           ? ['int', 'int', 'cell', 'slice']
@@ -85,7 +142,73 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
             : id === -2
               ? ['int', 'int']
               : undefined;
-      const result = analyze(code, { methods: irs, hints });
+      // Resolve calls at their instruction position, after preceding SETGLOBs
+      // have established types used by the callee (as in the Python engine).
+      const result = analyze(code, { methods: lift, hints, globalTypes });
+      // FunC assigns IDs to private functions starting at 1. For contracts
+      // exporting those IDs, inline helper IR rather than creating collisions.
+      if (
+        helperCode.has(id) &&
+        [...program.methods.keys()].some((key) => key > 0 && key <= helperCode.size)
+      ) {
+        const hasReturn = (body: Statement[]): boolean =>
+          body.some((s) => s.kind === 'return' || hasReturn(s.then) || hasReturn(s.otherwise));
+        const loopReturn = (body: Statement[]): boolean =>
+          body.some(
+            (s) =>
+              (['while', 'until', 'repeat'].includes(s.kind) && hasReturn(s.then)) ||
+              loopReturn(s.then) ||
+              loopReturn(s.otherwise),
+          );
+        if (hasReturn(result.statements) && !loopReturn(result.statements)) {
+          const values = [
+            ...allValues(result.statements),
+            ...result.returns.flatMap((v) => [...expressions(v)]),
+          ];
+          let next =
+            1 +
+            Math.max(
+              -1,
+              ...values.filter((v) => v.op === 'local').map((v) => Number(v.value.slice(1))),
+            );
+          const targets = result.returns.map((v) => expr('local', `v${next++}`, v.type));
+          const product = (vs: Expr[]) => (vs.length === 1 ? vs[0] : expr('product', '', '()', vs));
+          let count = 0;
+          const lower = (body: Statement[]): Statement[] => {
+            const out: Statement[] = [];
+            for (let i = 0; i < body.length; i++) {
+              if (++count > 256)
+                throw new UnsupportedInstruction(
+                  'CALL',
+                  'Early-return inlining exceeds 256 statements',
+                );
+              const s = body[i];
+              if (s.kind === 'return') {
+                if (targets.length)
+                  out.push(statement('set', [product(targets), product(s.values)]));
+                break;
+              }
+              if (s.kind === 'if' && hasReturn([s])) {
+                const tail = body.slice(i + 1);
+                out.push({
+                  ...s,
+                  then: lower([...s.then, ...tail]),
+                  otherwise: lower([...s.otherwise, ...tail]),
+                });
+                break;
+              }
+              out.push(s);
+            }
+            return out;
+          };
+          result.statements = [
+            ...targets.map((t) => statement('declare', [t])),
+            ...lower([...result.statements, statement('return', result.returns)]),
+          ];
+          result.returns = targets;
+        }
+        result.inlineBody = !hasReturn(result.statements);
+      }
       if (id === 0 || id === -1) result.returns = [];
       irs.set(id, result);
       return result;
@@ -119,6 +242,23 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
       functions.push({ ...fallback.get(id)!, diagnostic: e.message });
     }
   }
+  // Only emit helpers actually reached by successfully analyzed methods.
+  for (const [id, ir] of irs) {
+    if (!helperCode.has(id) || ir.inlineBody) continue;
+    ir.primitives.forEach((p) => primitives.set(p.name, p));
+    functions.unshift({
+      id,
+      name: methodName(id),
+      args: ir.argumentTypes.map((t, i) => [t, `arg${i}`]),
+      returns: ir.returns,
+      statements: ir.statements,
+      helper: true,
+    });
+  }
+  // FunC must see inline_ref bodies before their callers. Forward references
+  // can otherwise be optimized away, particularly effectful () helpers.
+  const order = new Map([...irs.keys()].map((id, index) => [id, index]));
+  functions.sort((a, b) => (order.get(a.id) ?? Infinity) - (order.get(b.id) ?? Infinity));
   return {
     functions,
     primitives: [...primitives.values()],
@@ -180,6 +320,15 @@ const names: Record<string, string> = {
 };
 export function primitiveName(name: string): string {
   if (names[name]) return names[name];
+  const global = /^tvm_(getglob|setglob|is_global_null)_(\d+)$/.exec(name);
+  if (global) {
+    const prefix = {
+      getglob: 'get_global',
+      setglob: 'set_global',
+      is_global_null: 'is_global_null',
+    };
+    return prefix[global[1] as keyof typeof prefix] + '_' + global[2];
+  }
   const m = /^tvm_(ldu|ldi|pldu|pldi|stu|sti)_(\d+)$/.exec(name);
   return m
     ? {
@@ -284,7 +433,11 @@ function* allValues(body: Statement[]): Generator<Expr> {
   }
 }
 const sourceType = (type: string): string =>
-  type.startsWith('list_') || type.startsWith('vector_') ? 'tuple' : type;
+  type.startsWith('list_') || type.startsWith('vector_')
+    ? 'tuple'
+    : type.startsWith('[')
+      ? '[' + tupleTypes(type).map(sourceType).join(', ') + ']'
+      : type;
 const signature = (types: string[]) =>
   types.length === 1 ? sourceType(types[0]) : `(${types.map(sourceType).join(', ')})`;
 function hasNullDeclaration(body: Statement[]): boolean {
@@ -351,7 +504,9 @@ export function renderParts(
       result = signature(f.returns.map((e) => (e.type === 'null' ? 'cell' : e.type)));
     const vars = [...new Set(f.args.map(([t]) => t).filter((t) => /^X\d*$/.test(t)))],
       prefix = vars.length ? 'forall ' + vars.join(', ') + ' -> ' : '';
-    const attributes = ' impure' + ([0, -1, -2].includes(f.id) ? '' : ` method_id(${f.id})`);
+    const attributes =
+      ' impure' +
+      (f.helper ? ' inline_ref' : [0, -1, -2].includes(f.id) ? '' : ` method_id(${f.id})`);
     if (f.assembly && display) {
       lines.push(
         `${f.name}(${args})${attributes} fift {`,
