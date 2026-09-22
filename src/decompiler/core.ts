@@ -3,7 +3,9 @@ import { BocError, DecompilerError } from './errors';
 import { codeHash, methodCells } from './boc';
 import { disassembleProgram } from './disassembler';
 import { reconstruct, readableModule, render, renderParts } from './func';
-export function reconstructReadable(boc: Uint8Array) {
+import { renderTolk } from './tolk';
+export type OutputLanguage = 'func' | 'tolk';
+export function reconstructReadable(boc: Uint8Array, language: OutputLanguage = 'func') {
   let originalHash: string;
   try {
     originalHash = codeHash(boc);
@@ -21,14 +23,22 @@ export function reconstructReadable(boc: Uint8Array) {
       'disassembly',
     );
   }
-  const module = readableModule(reconstruct(program, methodCells(boc)));
+  const rawModule = reconstruct(program, methodCells(boc));
+  const module = language === 'tolk' ? rawModule : readableModule(rawModule);
+  const tolk = language === 'tolk' ? renderTolk(module, program) : undefined;
+  const parts = tolk ?? renderParts(module);
+  const source = tolk?.source ?? render(module);
   const methods = module.functions.filter((f) => !f.helper);
   const lifted = methods.filter((f) => !f.assembly).length;
   return {
     success: true as const,
-    func: render(module),
-    ...renderParts(module),
-    ...(lifted < methods.length
+    language,
+    source,
+    func: tolk ? undefined : source,
+    tolk: tolk?.source,
+    contract: parts.contract,
+    stdlib: parts.stdlib,
+    ...(!tolk && lifted < methods.length
       ? {
           display_contract: renderParts(module, program).contract,
           display_stdlib: renderParts(module, program).stdlib,
@@ -37,6 +47,8 @@ export function reconstructReadable(boc: Uint8Array) {
       : {}),
     decompilation: {
       quality: 'unverified',
+      output_language: language,
+      source_language: 'unknown',
       recompiles: false,
       exact_hash_match: false,
       verification_performed: false,

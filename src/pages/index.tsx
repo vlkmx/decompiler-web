@@ -1,5 +1,6 @@
 import Head from "next/head";
 import { useEffect, useRef, useState } from "react";
+import type { OutputLanguage } from "@/decompiler/core";
 import styles from "@/styles/Home.module.css";
 
 import type {
@@ -11,6 +12,7 @@ type Tab = "contract" | "stdlib" | "json";
 const resultCache = new Map<string, DecompilationResult>();
 
 export default function Home() {
+  const [language, setLanguage] = useState<OutputLanguage>("func");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -33,7 +35,7 @@ export default function Home() {
     setError("");
     setCopied(false);
     setTab("contract");
-    const cached = resultCache.get(raw);
+    const cached = resultCache.get(`${language}:${raw}`);
     setResult(cached ?? null);
     if (cached) {
       setBusy(false);
@@ -57,7 +59,7 @@ export default function Home() {
         setBusy(false);
         if ("error" in event.data) setError(event.data.error);
         else {
-          resultCache.set(raw, event.data.result);
+          resultCache.set(`${language}:${raw}`, event.data.result);
           setResult(event.data.result);
         }
       };
@@ -71,7 +73,7 @@ export default function Home() {
         setBusy(false);
         setError("Decompilation exceeded the 30-second limit.");
       }, 30_000);
-      worker.postMessage(raw);
+      worker.postMessage({ code: raw, language });
     } catch (cause) {
       stop();
       setBusy(false);
@@ -99,24 +101,24 @@ export default function Home() {
     }
   }
   function download() {
-    // Contract and helper declarations together make a standalone FunC file.
-    const content = tab === "contract" ? (result?.func ?? source) : source;
+    // Include helpers with the contract download.
+    const content = tab === "contract" ? (result?.source ?? source) : source;
     const url = URL.createObjectURL(
       new Blob([content], { type: "text/plain;charset=utf-8" }),
     );
     const a = document.createElement("a");
     a.href = url;
-    a.download = tab === "json" ? "decompilation.json" : `contract-${tab}.fc`;
+    a.download = tab === "json" ? "decompilation.json" : `contract-${tab}.${result?.language === "tolk" ? "tolk" : "fc"}`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   return (
     <>
       <Head>
-        <title>TON Decompiler — BOC → FunC</title>
+        <title>TON Decompiler — BOC → FunC / Tolk</title>
         <meta
           name="description"
-          content="Decompile TON smart contract bytecode into readable FunC."
+          content="Decompile TON smart contract bytecode into readable FunC or Tolk."
         />
       </Head>
       <main className={styles.main}>
@@ -125,7 +127,7 @@ export default function Home() {
             <span className={styles.logo}>T</span> TON
             <span className={styles.muted}>Decompiler</span>
           </a>
-          <span className={styles.badge}>BOC → FunC</span>
+          <span className={styles.badge}>BOC → FunC / Tolk</span>
         </header>
         <section className={styles.intro}>
           <div className={styles.eyebrow}>TON DEVELOPER TOOLS</div>
@@ -136,7 +138,7 @@ export default function Home() {
           </h1>
           <p>
             Paste a contract code BOC to reconstruct functions, control flow,
-            and data operations in readable FunC.
+            and data operations in readable FunC or Tolk.
           </p>
         </section>
         <section className={styles.panel} aria-label="Contract input">
@@ -153,7 +155,14 @@ export default function Home() {
             placeholder="te6ccgE…"
           />
           <div className={styles.actions}>
-            <span className={styles.muted}>Runs locally in your browser</span>
+            <label>
+              Output language{" "}
+              <select aria-label="Output language" value={language} disabled={busy}
+                onChange={(e) => { setLanguage(e.target.value as OutputLanguage); setResult(null); setCopied(false); }}>
+                <option value="func">FunC</option>
+                <option value="tolk">Tolk (experimental)</option>
+              </select>
+            </label>
             <div className={styles.buttons}>
               {busy && <button onClick={cancel}>Cancel</button>}
               <button
@@ -173,7 +182,7 @@ export default function Home() {
         )}
         {busy && (
           <p role="status" className={styles.loading}>
-            Analyzing instructions and reconstructing FunC in your browser.
+            Analyzing instructions and reconstructing {language === "tolk" ? "Tolk" : "FunC"} in your browser.
           </p>
         )}
         {result && (
@@ -185,7 +194,7 @@ export default function Home() {
               </div>
               <span className={styles.badge}>
                 {result.decompilation.structured_method_count} /{" "}
-                {result.decompilation.method_count} methods in FunC
+                {result.decompilation.method_count} methods in {result.language === "tolk" ? "Tolk" : "FunC"}
                 {!!result.decompilation.partial_method_count &&
                   ` · ${result.decompilation.partial_method_count} partial`}
               </span>
@@ -199,6 +208,8 @@ export default function Home() {
               {result.decompilation.structured_method_count <
                 result.decompilation.method_count &&
                 " Some methods are preserved as assembly."}
+              {result.language === "tolk" &&
+                " Experimental Tolk output: original names and structs are unknown; unresolved methods are comments, not executable implementations."}
             </p>
             <div className={styles.toolbar}>
               <div
@@ -212,7 +223,7 @@ export default function Home() {
                       "contract",
                       result.display_contract
                         ? "FunC + TVM preview"
-                        : "Readable FunC",
+                        : result.language === "tolk" ? "Readable Tolk" : "Readable FunC",
                     ],
                     ["stdlib", "Helpers"],
                     ["json", "JSON"],

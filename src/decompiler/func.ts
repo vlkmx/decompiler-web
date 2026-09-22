@@ -120,13 +120,15 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
     }
     return result;
   }
-  const methods = new Map([...program.methods].map(([id, code]) => [id, staticCalls(code)]));
+  const methods = new Map([...program.methods].sort(([a], [b]) => a - b)
+    .map(([id, code]) => [id, staticCalls(code)]));
   for (const [id, code] of helperCode) methods.set(id, code);
   const irs = new Map<number, StackIR>(),
     partials = new Map<number, PartialIR>(),
     globalTypes = new Map<number, string>(),
     failures = new Map<number, UnsupportedInstruction>(),
     active = new Set<number>();
+  const shapeHints = new Map<number, string[]>();
   const fallback = cells
     ? new Map(fallbackCells(program, cells).functions.map((f) => [f.id, f]))
     : undefined;
@@ -146,13 +148,23 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
             : id === -2
               ? ['int', 'int']
               : undefined;
+      const previousHints = shapeHints.get(id) ?? [];
+      const incomingHints = callerHints ?? [];
+      const width = Math.max(previousHints.length, incomingHints.length);
+      const argumentHints = Array.from({ length: width }, (_, j) => {
+        const incoming = incomingHints[j - width + incomingHints.length];
+        return incoming && /^(\[|vector_|list_)/.test(incoming)
+          ? incoming : previousHints[j - width + previousHints.length] ?? 'unknown';
+      });
       // Resolve calls at their instruction position, after preceding SETGLOBs
       // have established types used by the callee (as in the Python engine).
       const result = analyze(code, {
         methods: lift,
         hints,
         globalTypes,
-        argumentHints: callerHints?.map((type) => (type.startsWith('[') ? type : 'unknown')),
+        // Scalar inputs are inferred parametrically, independently of callers.
+        // Structural tuple operations still need an element shape to analyze.
+        argumentHints,
         onPartial: (partial) => partials.set(id, partial),
       });
       // FunC assigns IDs to private functions starting at 1. For contracts
@@ -220,6 +232,8 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
         result.inlineBody = !hasReturn(result.statements);
       }
       if (id === 0 || id === -1) result.returns = [];
+      shapeHints.set(id, result.argumentTypes.map(type =>
+        /^(\[|vector_|list_)/.test(type) ? type : 'unknown'));
       irs.set(id, result);
       failures.delete(id);
       return result;
@@ -235,19 +249,45 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
     primitives = new Map<string, Primitive>(),
     diagnostics: string[] = [],
     unsupported: string[] = [];
-  // A later caller can supply tuple shapes and initialize globals that were
-  // unavailable on the first visit. Finish discovery before emitting fallbacks.
-  for (let pass = 0; pass <= methods.size; pass++) {
-    const before = JSON.stringify([[...irs.keys()], [...globalTypes]]);
+  // Prefer roots for discovery of tuple shapes. Stable ID order also makes
+  // synthetic helper allocation and fallback diagnostics reproducible.
+  const called = new Set([...methods.values()].flatMap((code) =>
+    [...walk(code)].filter((i) => i.opcode === 'CALLDICT' || i.opcode === 'JMPDICT')
+      .map((i) => Number(i.operands[0]))));
+  const discoveryOrder = [...program.methods.keys()].sort((a, b) =>
+    Number(called.has(a)) - Number(called.has(b)) || a - b);
+  const snapshot = () => JSON.stringify([
+    [...irs].sort(([a], [b]) => a - b).map(([id, ir]) =>
+      [id, ir.argumentTypes, ir.returns.map(v => v.type)]),
+    [...globalTypes].sort(([a], [b]) => a - b),
+    [...shapeHints].sort(([a], [b]) => a - b),
+    [...failures].sort(([a], [b]) => a - b).map(([id, e]) => [id, e.opcode, e.message]),
+  ]);
+  // Rebuild callers as well as callees after constraints change. Keeping old
+  // successful IR here could retain return types inferred before globals or
+  // tuple shapes were known. Never seed a recursive call with a guessed arity.
+  let previous = '';
+  for (let pass = 0; pass <= methods.size + 1; pass++) {
+    irs.clear();
     failures.clear();
-    for (const id of program.methods.keys()) {
+    partials.clear();
+    for (const id of discoveryOrder) {
       try {
         lift(id);
       } catch (error) {
         if (!(error instanceof UnsupportedInstruction)) throw error;
       }
     }
-    if (before === JSON.stringify([[...irs.keys()], [...globalTypes]])) break;
+    const current = snapshot();
+    if (current === previous) break;
+    if (pass === methods.size + 1) {
+      // Keep method cells available even if the bounded solver cannot settle.
+      irs.clear();
+      for (const id of methods.keys()) failures.set(id,
+        new UnsupportedInstruction('type', 'Method signature inference did not converge'));
+      break;
+    }
+    previous = current;
   }
   for (const [id] of [...program.methods].sort(([a], [b]) => a - b)) {
     try {

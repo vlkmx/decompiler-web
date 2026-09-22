@@ -5,6 +5,7 @@ import { instruction, type Instruction } from './asm';
 import { UnsupportedInstruction } from './errors';
 import { primitiveSignatures } from './primitives';
 import { parseBoc } from './boc';
+import { isDecimalDigitLoop, isDecimalConversion } from './patterns';
 export { UnsupportedInstruction } from './errors';
 export interface Expr {
   op: string;
@@ -141,12 +142,44 @@ export function analyze(
   let localCount = 0,
     steps = 0;
   const local = (type: string) => expr('local', `v${localCount++}`, type);
+  // A generic call result and its corresponding input share a type constraint,
+  // not a value. Keep that relationship until all uses have been analyzed.
+  const typeGroups = new Map<Expr, Set<Expr>>();
+  const nullBindings: Expr[] = [];
+  const group = (value: Expr) => {
+    if (!typeGroups.has(value)) typeGroups.set(value, new Set([value]));
+    return typeGroups.get(value)!;
+  };
+  function bindType(value: Expr, type: string) {
+    for (const member of group(value)) member.type = type;
+  }
+  function unifyTypes(a: Expr, b: Expr) {
+    if (a.type === 'null' || b.type === 'null') return;
+    if (a.type !== 'unknown' && b.type !== 'unknown') {
+      requireType(b, a.type);
+      return;
+    }
+    const left = group(a), right = group(b);
+    if (left === right) return;
+    const type = a.type === 'unknown' ? b.type : a.type;
+    if (type !== 'unknown') {
+      if (a.type === 'unknown') for (const member of left) member.type = type;
+      if (b.type === 'unknown') for (const member of right) member.type = type;
+    }
+    // Merge smaller groups into larger ones: long chains of pass-through calls
+    // must not repeatedly copy every already-linked expression.
+    const [large, small] = left.size >= right.size ? [left, right] : [right, left];
+    for (const member of small) {
+      large.add(member);
+      typeGroups.set(member, large);
+    }
+  }
   function requireType(value: Expr, type: string) {
     if (type === 'X' || /^X\d+$/.test(type) || value.type === 'null') return;
     if (value.type === 'vector_empty' && type.startsWith('vector_')) return;
     if (type === 'tuple' && /^(vector_|list_|\[)/.test(value.type)) return;
-    if (value.type === 'unknown' && value.op === 'arg') {
-      value.type = type;
+    if (value.type === 'unknown' && (value.op === 'arg' || typeGroups.has(value))) {
+      bindType(value, type);
       return;
     }
     if (value.type.startsWith('[') && type.startsWith('[')) {
@@ -448,12 +481,19 @@ export function analyze(
         index++;
         continue;
       }
-      if (['DICTGET', 'DICTUGET', 'DICTIGET', 'DICTUGETREF', 'DICTIGETREF'].includes(op)) {
-        if (code[index + 1]?.opcode !== 'NULLSWAPIFNOT')
-          throw new UnsupportedInstruction(op, 'Dictionary lookup needs padded results');
+      if (['DICTGET', 'DICTUGET', 'DICTIGET', 'DICTGETREF', 'DICTUGETREF', 'DICTIGETREF'].includes(op)) {
+        const next = code[index + 1];
+        if (next?.opcode === 'THROWIFNOT' && next.operands.length === 1 && /^\d+$/.test(next.operands[0])) {
+          primitive(op, [op === 'DICTGET' || op === 'DICTGETREF' ? 'slice' : 'int', 'cell', 'int'],
+            [op.endsWith('REF') ? 'cell' : 'slice'], `${op} ${next.operands[0]} THROWIFNOT`, '_assert_' + next.operands[0]);
+          index++;
+          continue;
+        }
+        if (next?.opcode !== 'NULLSWAPIFNOT')
+          throw new UnsupportedInstruction(op, 'Dictionary lookup needs padding or immediate success assertion');
         primitive(
           op,
-          [op === 'DICTGET' ? 'slice' : 'int', 'cell', 'int'],
+          [op === 'DICTGET' || op === 'DICTGETREF' ? 'slice' : 'int', 'cell', 'int'],
           [op.endsWith('REF') ? 'cell' : 'slice', 'int'],
           op + ' NULLSWAPIFNOT',
         );
@@ -461,7 +501,7 @@ export function analyze(
         continue;
       }
       if (
-        /^DICT[UI](?:(?:REM)?(?:MIN|MAX)|GET(?:NEXT|PREV)(?:EQ)?)$/.test(op) ||
+        /^DICT[UI]?(?:(?:REM)?(?:MIN|MAX)(?:REF)?|GET(?:NEXT|PREV)(?:EQ)?)$/.test(op) ||
         op === 'DICTREMMIN' ||
         op === 'DICTUMINREF'
       ) {
@@ -469,11 +509,11 @@ export function analyze(
           throw new UnsupportedInstruction(op, 'Dictionary iteration needs padded results');
         primitive(
           op,
-          op.includes('GET') ? ['int', 'cell', 'int'] : ['cell', 'int'],
+          op.includes('GET') ? [/^DICT[UI]/.test(op) ? 'int' : 'slice', 'cell', 'int'] : ['cell', 'int'],
           [
             ...(op.includes('REM') ? ['cell'] : []),
-            op === 'DICTUMINREF' ? 'cell' : 'slice',
-            op === 'DICTREMMIN' ? 'slice' : 'int',
+            op.endsWith('REF') ? 'cell' : 'slice',
+            /^DICT[UI]/.test(op) ? 'int' : 'slice',
             'int',
           ],
           op + ' NULLSWAPIFNOT2',
@@ -482,6 +522,20 @@ export function analyze(
         continue;
       }
 
+      if (/^DICT[UI]?(?:SETGET|ADDGET)B$/.test(op)) {
+        if (code[index + 1]?.opcode !== 'NULLSWAPIFNOT')
+          throw new UnsupportedInstruction(op, 'Dictionary update needs padded results');
+        primitive(op, ['builder', /^DICT[UI]/.test(op) ? 'int' : 'slice', 'cell', 'int'],
+          ['cell', 'slice', 'int'], `${op} NULLSWAPIFNOT`);
+        index++;
+        continue;
+      }
+      if (/^LSHIFT_DIV[RC]?$/.test(op)) {
+        const width = number();
+        if (width < 1 || width > 256) throw new UnsupportedInstruction(op, 'Invalid shift width');
+        primitive(op, ['int', 'int'], ['int'], `${width} ${op.replace('LSHIFT_DIV', 'LSHIFT#DIV')}`, '_' + width);
+        continue;
+      }
       if (op === 'RET') return { body, terminal: false };
       if (op === 'PUSHINT') {
         stack.push(literal(imm()));
@@ -714,6 +768,24 @@ export function analyze(
         computed(expr('binary', binary[op] ?? '-', 'int', op === 'SUBR' ? [b, a] : [a, b]));
         continue;
       }
+      if (op === 'CONDSEL') {
+        if (stack.length < 3) throw new StackUnderflow();
+        const a = stack[stack.length - 3], b = stack[stack.length - 2];
+        const kind = [a.type, b.type].find(t => t !== 'null' && t !== 'unknown');
+        if (!kind) throw new UnsupportedInstruction(op, 'Unresolved selected value type');
+        // Preserve eager operands, TVM flag validation, and the exact selection order.
+        primitive(op, [kind, kind, 'int'], [kind], op, '_' + typeKey(kind));
+        continue;
+      }
+      if (op === 'CDATASIZEQ' || op === 'SDATASIZEQ') {
+        // Quiet failures have fewer results; only lift the explicitly padded form.
+        if (code[index + 1]?.opcode !== 'NULLSWAPIFNOT2' || code[index + 2]?.opcode !== 'NULLSWAPIFNOT')
+          throw new UnsupportedInstruction(op, 'Data size operation needs padded results');
+        primitive(op, [op === 'CDATASIZEQ' ? 'cell' : 'slice', 'int'],
+          ['int', 'int', 'int', 'int'], `${op} NULLSWAPIFNOT2 NULLSWAPIFNOT`);
+        index += 2;
+        continue;
+      }
       if (op === 'NEGATE' || op === 'NOT') {
         const a = pop();
         requireType(a, 'int');
@@ -783,15 +855,47 @@ export function analyze(
           throw new UnsupportedInstruction(op, `Unknown or recursive method signature: ${id}`);
         const values = take(callee.arguments);
         values.forEach((v, j) => requireType(v, callee.argumentTypes[j]));
+        const bindings = new Map<string, Expr>();
+        callee.argumentTypes.forEach((type, j) => {
+          if (!/^X\d*$/.test(type)) return;
+          const existing = bindings.get(type);
+          if (existing) unifyTypes(existing, values[j]);
+          if (!existing || existing.type === 'null') bindings.set(type, values[j]);
+        });
+        for (const [type, value] of bindings) {
+          if (value.type !== 'null') continue;
+          const nullable = { ...value, type: 'unknown' };
+          values.forEach((v, j) => { if (v === value) values[j] = nullable; });
+          bindings.set(type, nullable);
+          nullBindings.push(nullable);
+        }
+        values.forEach((value, j) => {
+          const binding = bindings.get(callee.argumentTypes[j]);
+          if (value.type !== 'null' || !binding) return;
+          const nullable = { ...value, type: binding.type };
+          if (binding.type === 'unknown') unifyTypes(nullable, binding);
+          values[j] = nullable;
+          nullBindings.push(nullable);
+        });
+        const resultLocal = (type: string) => {
+          const binding = bindings.get(type);
+          const target = local(binding?.type ?? type);
+          if (binding && binding.type !== 'null') unifyTypes(target, binding);
+          return target;
+        };
         if (callee.inlineBody) {
           const locals = new Map<string, Expr>();
           const substitute = (value: Expr): Expr => {
             if (value.op === 'arg') return values[Number(value.value.slice(3))];
             if (value.op === 'local') {
-              if (!locals.has(value.value)) locals.set(value.value, local(value.type));
+              if (!locals.has(value.value)) locals.set(value.value, resultLocal(value.type));
               return locals.get(value.value)!;
             }
-            return { ...value, args: value.args.map(substitute) };
+            const binding = bindings.get(value.type);
+            const rewritten = { ...value, type: binding?.type ?? value.type,
+              args: value.args.map(substitute) };
+            if (binding && binding.type === 'unknown') unifyTypes(rewritten, binding);
+            return rewritten;
           };
           const rewrite = (s: Statement): Statement => ({
             ...s,
@@ -809,7 +913,7 @@ export function analyze(
           }
           continue;
         }
-        const results = callee.returns.map((v) => local(v.type)),
+        const results = callee.returns.map((v) => resultLocal(v.type)),
           call = expr('call', methodName(id), results[0]?.type ?? '()', values);
         body.push(
           results.length
@@ -888,9 +992,11 @@ export function analyze(
             : left[k].type;
           requireType(left[k], kind);
           requireType(right[k], kind);
-          if (kind === 'unknown')
-            throw new UnsupportedInstruction('type', 'Unknown branch result type');
           const target = local(kind);
+          if (kind === 'unknown') {
+            unifyTypes(left[k], right[k]);
+            unifyTypes(target, left[k].type === 'unknown' ? left[k] : right[k]);
+          }
           body.push(statement('declare', [target]));
           merged.push(target);
           targets.push(target);
@@ -905,33 +1011,121 @@ export function analyze(
         stack.splice(0, stack.length, ...merged);
         continue;
       }
-      if (['REPEAT', 'UNTIL', 'WHILE', 'AGAINEND'].includes(op)) {
-        const needed = op === 'AGAINEND' ? 0 : op === 'WHILE' ? 2 : 1;
+      if (op === 'UNTIL' && isDecimalConversion(code) && pending.length === 1 &&
+          isDecimalDigitLoop(pending[0], code.slice(index + 1, index + 4)) &&
+          stack.at(-2)?.op === 'literal' && stack.at(-2)?.value === '0') {
+        // The exact decimal conversion idiom has a bounded dynamic stack (at most
+        // 78 digits for TVM integers). Spill those digits into a typed tuple so
+        // the two loops have a fixed high-level state. The sign handling and
+        // NEGATE preceding this idiom remain untouched, including overflow.
+        const [initialBuilder, initialCount, initialValue] = take(3);
+        requireType(initialBuilder, 'builder');
+        requireType(initialValue, 'int');
+        pending.pop();
+        const b = local('builder'), n = local('int'), count = local('int'),
+          digits = local('vector_int'), quotient = local('int'), remainder = local('int'),
+          digit = local('int'), popped = local('int');
+        const call = (name: string, inputs: string[], outputs: string[], assembly: string, args: Expr[]) => {
+          primitives.set(name, { name, inputs, outputs, assembly });
+          return expr('call', name, outputs[0] ?? '()', args);
+        };
+        const touch = (value: Expr) => call('impure_touch', ['X'], ['X'], 'NOP', [value]);
+        body.push(statement('assign', [b, initialBuilder]), statement('assign', [n, initialValue]),
+          statement('assign', [count, initialCount]),
+          statement('assign', [digits, call('tvm_decimal_digits_empty', [], ['vector_int'], '0 TUPLE', [])]));
+        body.push(statement('until', [expr('binary', '==', 'int', [n, literal(0)])], [
+          statement('assign', [product([quotient, remainder]), call('tvm_divmod', ['int', 'int'], ['int', 'int'], 'DIVMOD', [n, literal(10)])]),
+          statement('assign', [digit, touch(expr('binary', '+', 'int', [remainder, literal(48)]))]),
+          statement('set', [digits, call('tvm_decimal_digits_push', ['vector_int', 'int'], ['vector_int'], 'TPUSH', [digits, digit])]),
+          statement('set', [count, touch(expr('binary', '+', 'int', [count, literal(1)]))]),
+          statement('set', [n, quotient]),
+        ]));
+        body.push(statement('repeat', [count], [
+          statement('declare', [popped]),
+          statement('set', [product([digits, popped]), call('tvm_decimal_digits_pop', ['vector_int'], ['vector_int', 'int'], 'TPOP', [digits])]),
+          statement('set', [b, call('tvm_stu_8', ['int', 'builder'], ['builder'], '8 STU', [popped, b])]),
+        ]));
+        stack.push(b);
+        index += 3;
+        continue;
+      }
+      if (op === 'WHILE') {
+        if (pending.length < 2) throw new UnsupportedInstruction(op, 'Dynamic loop');
+        const [testCode, bodyCode] = pending.splice(pending.length - 2, 2);
+        // A WHILE test transforms the head stack X into Y + flag. Its body
+        // transforms Y back into X. The false exit exposes Y, not X.
+        const probe = [...stack];
+        const probeTest = execute(testCode, probe, depth + 1, true);
+        if (probeTest.terminal) throw new UnsupportedInstruction(op, 'Terminal loop condition');
+        const probeFlag = probe.pop();
+        if (!probeFlag) throw new StackUnderflow();
+        requireType(probeFlag, 'int');
+        const probeRun = execute(bodyCode, probe, depth + 1, true);
+        if (!probeRun.terminal && probe.length !== stack.length)
+          throw new UnsupportedInstruction(op, 'Loop cycle changes stack height');
+        const carried = stack.map((value, k) => {
+          if (value.type === 'unknown' && (probeRun.terminal || same(value, probe[k]))) return value;
+          const other = probeRun.terminal ? undefined : probe[k];
+          const kind = ['null', 'vector_empty', 'unknown'].includes(value.type) && other && other.type !== 'null'
+            ? other.type : value.type;
+          requireType(value, kind);
+          const target = local(kind);
+          if (kind === 'unknown') {
+            if (other) unifyTypes(value, other);
+            unifyTypes(target, value);
+          }
+          body.push(statement('assign', [target, value]));
+          return target;
+        });
+        const tested = [...carried];
+        const test = execute(testCode, tested, depth + 1, true);
+        const condition = tested.pop();
+        if (!condition || test.terminal) throw new UnsupportedInstruction(op, 'Invalid loop condition');
+        requireType(condition, 'int');
+        const exits = tested.map(value => {
+          if (value.type === 'unknown' && value.op === 'arg') return value;
+          const target = local(value.type);
+          if (value.type === 'unknown') unifyTypes(target, value);
+          body.push(statement('declare', [target]));
+          return target;
+        });
+        const runStack = [...tested];
+        const run = execute(bodyCode, runStack, depth + 1, true);
+        const loopBody = [...run.body];
+        if (!run.terminal) {
+          if (runStack.length !== carried.length) throw new UnsupportedInstruction(op, 'Loop cycle changes stack height');
+          const updates = carried.map((target, k) => ({target, value: runStack[k]})).filter(p => !same(p.target, p.value));
+          for (const {target, value} of updates) {
+            if (target.op !== 'local') throw new UnsupportedInstruction(op, 'Loop changes inferred invariant');
+            if (target.type === 'unknown') unifyTypes(target, value);
+            else requireType(value, target.type);
+          }
+          if (updates.length) loopBody.push(statement('set', [product(updates.map(p=>p.target)), product(updates.map(p=>p.value))]));
+        }
+        const flag = local('int');
+        body.push(statement('assign', [flag, literal(-1)]));
+        const exitUpdates = exits.map((target,k)=>({target,value:tested[k]})).filter(p=>!same(p.target,p.value));
+        body.push(statement('while', [flag], [
+          ...test.body,
+          ...(exitUpdates.length ? [statement('set', [product(exitUpdates.map(p=>p.target)), product(exitUpdates.map(p=>p.value))])] : []),
+          statement('set', [flag, condition]),
+          statement('if', [flag], loopBody),
+        ]));
+        stack.splice(0, stack.length, ...exits);
+        continue;
+      }
+      if (['REPEAT', 'UNTIL', 'AGAINEND'].includes(op)) {
+        const needed = op === 'AGAINEND' ? 0 : 1;
         if (pending.length < needed) throw new UnsupportedInstruction(op, 'Dynamic loop');
-        let parts =
+        const parts =
           op === 'AGAINEND'
             ? [code.slice(index + 1)]
             : pending.splice(pending.length - needed, needed);
-        let loopOp = op;
+        const loopOp = op;
         const repeats = op === 'REPEAT' ? pop() : undefined;
         if (repeats) requireType(repeats, 'int');
-        if (
-          op === 'WHILE' &&
-          parts[0].length === 0 &&
-          stack.at(-1)?.op === 'literal' &&
-          /^-?\d+$/.test(stack.at(-1)!.value) &&
-          BigInt(stack.at(-1)!.value) !== 0n
-        ) {
-          pop();
-          loopOp = 'UNTIL';
-          parts = [[...parts[1], instruction('EQINT', ['0'])]];
-        }
-        if (loopOp === 'WHILE') {
-          const probe = [...stack];
-          execute(parts[0], probe, depth + 1, true);
-        }
         const probe = [...stack];
-        execute(loopOp === 'WHILE' ? parts[1] : parts[0], probe, depth + 1, true);
+        execute(parts[0], probe, depth + 1, true);
         const carried = stack.map((value, k) => {
           if (value.type === 'unknown' && probe[k] === value) return value;
           let kind = value.type;
@@ -941,41 +1135,17 @@ export function analyze(
             !['unknown', 'null'].includes(probe[k].type)
           )
             kind = probe[k].type;
-          if (kind === 'unknown') {
-            requireType(value, 'int');
-            kind = 'int';
-          }
           const target = local(kind);
+          if (kind === 'unknown') {
+            if (probe[k]) unifyTypes(value, probe[k]);
+            unifyTypes(target, value);
+          }
           body.push(statement('assign', [target, value]));
           return target;
         });
-        let condition: Expr = repeats ?? literal(-1),
-          testBody: Statement[] = [];
-        if (loopOp === 'WHILE') {
-          const testStack = [...carried],
-            test = execute(parts[0], testStack, depth + 1, true);
-          const flag = testStack.pop();
-          if (
-            !flag ||
-            test.terminal ||
-            testStack.length !== carried.length ||
-            testStack.some((v, k) => !same(v, carried[k]))
-          )
-            throw new UnsupportedInstruction(op, 'Condition changes carried stack');
-          requireType(flag, 'int');
-          condition = flag;
-          testBody = test.body;
-          if (
-            testBody.length === 1 &&
-            testBody[0].kind === 'assign' &&
-            same(testBody[0].values[0], flag)
-          ) {
-            condition = testBody[0].values[1];
-            testBody = [];
-          }
-        }
+        let condition: Expr = repeats ?? literal(-1);
         const runStack = [...carried],
-          run = execute(loopOp === 'WHILE' ? parts[1] : parts[0], runStack, depth + 1, true);
+          run = execute(parts[0], runStack, depth + 1, true);
         let loopBody = [...run.body];
         if (loopOp === 'UNTIL') {
           const flag = runStack.pop();
@@ -994,7 +1164,8 @@ export function analyze(
           for (const { target, value } of changed) {
             if (target.op !== 'local')
               throw new UnsupportedInstruction(op, 'Loop changes an inferred invariant');
-            requireType(value, target.type);
+            if (target.type === 'unknown') unifyTypes(target, value);
+            else requireType(value, target.type);
           }
           if (changed.length)
             loopBody.push(
@@ -1003,16 +1174,6 @@ export function analyze(
                 product(changed.map((p) => p.value)),
               ]),
             );
-        }
-        if (loopOp === 'WHILE' && testBody.length) {
-          const flag = local('int');
-          body.push(statement('assign', [flag, literal(-1)]));
-          loopBody = [
-            ...testBody,
-            statement('set', [flag, condition]),
-            statement('if', [flag], loopBody),
-          ];
-          condition = flag;
         }
         body.push(
           statement(loopOp === 'AGAINEND' ? 'while' : loopOp.toLowerCase(), [condition], loopBody),
@@ -1073,15 +1234,15 @@ export function analyze(
         } else primitive(op, ['tuple'], ['int']);
         continue;
       }
-      if (op === 'TPOP' || op === 'INDEXVAR') {
-        const vector = stack[stack.length - (op === 'TPOP' ? 1 : 2)];
+      if (op === 'TPOP' || op === 'INDEXVAR' || op === 'LAST') {
+        const vector = stack[stack.length - (op === 'INDEXVAR' ? 2 : 1)];
         if (!vector) throw new StackUnderflow();
         if (!vector.type.startsWith('vector_') || vector.type === 'vector_empty')
           throw new UnsupportedInstruction(op, 'Unknown vector element type');
         const element = vector.type.slice(7);
         primitive(
           op,
-          op === 'TPOP' ? [vector.type] : [vector.type, 'int'],
+          op === 'INDEXVAR' ? [vector.type, 'int'] : [vector.type],
           op === 'TPOP' ? [vector.type, element] : [element],
           op,
           '_' + typeKey(element),
@@ -1101,6 +1262,11 @@ export function analyze(
                 : op === 'UNPAIR'
                   ? 2
                   : number();
+        if (value.type.startsWith('vector_') && value.type !== 'vector_empty' && !['UNTUPLE', 'UNPAIR'].includes(op)) {
+          if (n < 0 || n > 254) throw new UnsupportedInstruction(op, 'Tuple index out of range');
+          primitive('INDEX', [value.type], [value.type.slice(7)], `${n} INDEX`, '_' + n + '_' + typeKey(value.type));
+          continue;
+        }
         const list = value.type.startsWith('list_');
         const types = list ? [value.type.slice(5), value.type] : tupleTypes(value.type);
         if (op === 'UNTUPLE' || op === 'UNPAIR') {
@@ -1139,7 +1305,7 @@ export function analyze(
         continue;
       }
       if (
-        ['LDU', 'LDI', 'PLDU', 'PLDI', 'STU', 'STI', 'LDSLICE', 'PLDSLICE', 'PLDREFIDX'].includes(
+        ['LDU', 'LDI', 'PLDU', 'PLDI', 'STU', 'STI', 'STUR', 'STIR', 'LDSLICE', 'PLDSLICE', 'PLDREFIDX'].includes(
           op,
         )
       ) {
@@ -1150,7 +1316,7 @@ export function analyze(
           kind = op.includes('SLICE') ? 'slice' : op === 'PLDREFIDX' ? 'cell' : 'int';
         primitive(
           op,
-          store ? ['int', 'builder'] : ['slice'],
+          store ? (op.endsWith('R') ? ['builder', 'int'] : ['int', 'builder']) : ['slice'],
           store ? ['builder'] : load ? [kind, 'slice'] : [kind],
           `${n} ${op}`,
           '_' + n,
@@ -1246,14 +1412,27 @@ export function analyze(
     );
     if (kinds.size > 1)
       throw new UnsupportedInstruction('return', 'Early and final return types differ');
-    const kind = [...kinds][0] ?? (exits.some((v) => v[i].type === 'null') ? 'cell' : 'int');
+    // Preserve an unconstrained input/result relationship instead of guessing
+    // int. A caller can instantiate the same signature with cell or slice.
+    if (!kinds.size && exits.some((v) => v[i].type === 'unknown')) {
+      const representative = exits.find((v) => v[i].type === 'unknown')![i];
+      for (const values of exits) {
+        if (values[i].type === 'null') values[i] = { ...values[i], type: 'unknown' };
+        unifyTypes(representative, values[i]);
+      }
+      continue;
+    }
+    const kind = [...kinds][0] ?? 'cell';
     for (const values of exits) {
       requireType(values[i], kind);
       if (values[i].type === 'null') values[i] = { ...values[i], type: kind };
     }
   }
   args.forEach((a, i) => {
-    if (a.type === 'unknown') a.type = `X${i}`;
+    if (a.type === 'unknown') bindType(a, `X${i}`);
+  });
+  nullBindings.forEach(value => {
+    if (value.type === 'unknown') bindType(value, 'cell');
   });
   return {
     arguments: count,

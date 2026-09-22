@@ -98,6 +98,8 @@ function convert(items: runtime.Instr[], depth = 0): Instruction[] {
     }
     if (/^(MULRSHIFT[RC]?|RSHIFT[RC]|MODPOW2)_$/.test(name)) name = name.slice(0, -1) + '#';
     const aliases: Record<string, string> = {
+      LSHIFT_VAR: 'LSHIFT',
+      RSHIFT_VAR: 'RSHIFT',
       DROP2: '2DROP',
       DUP2: '2DUP',
       SWAP2: '2SWAP',
