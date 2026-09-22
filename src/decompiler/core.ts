@@ -1,8 +1,8 @@
 /** Pure TypeScript reconstruction. No compiler, VM, subprocess, or WASM is used here. */
-import { BocError, DecompilerError } from './errors.js';
-import { codeHash, methodCells } from './boc.js';
-import { disassembleProgram } from './disassembler.js';
-import { reconstruct, readableModule, render, renderParts } from './func.js';
+import { BocError, DecompilerError } from './errors';
+import { codeHash, methodCells } from './boc';
+import { disassembleProgram } from './disassembler';
+import { reconstruct, readableModule, render, renderParts } from './func';
 export function reconstructReadable(boc: Uint8Array) {
   let originalHash: string;
   try {

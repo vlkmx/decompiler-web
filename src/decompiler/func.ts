@@ -1,4 +1,5 @@
-import { type Program, type Instruction, formatAsm, walk, instruction } from './asm.js';
+import { Buffer } from 'buffer';
+import { type Program, type Instruction, formatAsm, walk, instruction } from './asm';
 import {
   analyze,
   tupleTypes,
@@ -10,8 +11,8 @@ import {
   type Primitive,
   type StackIR,
   type PartialIR,
-} from './ir.js';
-import { UnsupportedInstruction } from './errors.js';
+} from './ir';
+import { UnsupportedInstruction } from './errors';
 export interface FunctionAst {
   id: number;
   name: string;
@@ -597,4 +598,4 @@ export function render(module: Module): string {
   const p = renderParts(module);
   return p.stdlib + '\n' + p.contract;
 }
-export { readableModule } from './readability.js';
+export { readableModule } from './readability';

@@ -1,10 +1,11 @@
-import { createHash } from 'node:crypto';
+import { Buffer } from 'buffer';
+import { sha256_sync } from '@ton/crypto';
 import { Cell } from '@ton/core';
-import { instruction, type Instruction } from './asm.js';
-import { UnsupportedInstruction } from './errors.js';
-import { primitiveSignatures } from './primitives.js';
-import { parseBoc } from './boc.js';
-export { UnsupportedInstruction } from './errors.js';
+import { instruction, type Instruction } from './asm';
+import { UnsupportedInstruction } from './errors';
+import { primitiveSignatures } from './primitives';
+import { parseBoc } from './boc';
+export { UnsupportedInstruction } from './errors';
 export interface Expr {
   op: string;
   args: Expr[];
@@ -86,7 +87,7 @@ export function tupleTypes(type: string): string[] {
   if (start < type.length - 1) parts.push(type.slice(start, -1).trim());
   return parts;
 }
-const typeKey = (type: string) => createHash('sha256').update(type).digest('hex').slice(0, 16);
+const typeKey = (type: string) => sha256_sync(type).toString('hex').slice(0, 16);
 class StackUnderflow extends Error {}
 export function continuations(code: Instruction[]): Instruction[] {
   return code.flatMap((i) => {

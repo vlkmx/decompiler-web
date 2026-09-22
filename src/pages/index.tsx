@@ -2,101 +2,90 @@ import Head from "next/head";
 import { useEffect, useRef, useState } from "react";
 import styles from "@/styles/Home.module.css";
 
-type View = {
-  func: string;
-  contract: string;
-  stdlib: string;
-  display_contract?: string;
-  display_stdlib?: string;
-  decompilation: {
-    structured_method_count: number;
-    partial_method_count?: number;
-    method_count: number;
-    exact_hash_match: boolean;
-    recompiles: boolean;
-    original_code_hash: string;
-    unsupported_instructions: string[];
-  };
-};
-type Result = View & {
-  success: boolean;
-  readable?: View;
-  diagnostics?: string[];
-  error?: { message: string };
-};
-type Tab = "contract" | "stdlib" | "exact" | "json";
+import type {
+  DecompilationResponse,
+  DecompilationResult,
+} from "@/lib/decompiler.worker";
+
+type Tab = "contract" | "stdlib" | "json";
+const resultCache = new Map<string, DecompilationResult>();
 
 export default function Home() {
   const [code, setCode] = useState("");
-  const [verify, setVerify] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [result, setResult] = useState<Result | null>(null);
+  const [result, setResult] = useState<DecompilationResult | null>(null);
   const [tab, setTab] = useState<Tab>("contract");
   const [copied, setCopied] = useState(false);
-  const request = useRef<AbortController | null>(null);
-  useEffect(() => () => request.current?.abort(), []);
-  const view = result?.readable ?? result;
-  const shown = tab === "exact" ? result : view;
-  const source =
-    result && view
-      ? tab === "json"
-        ? JSON.stringify(result, null, 2)
-        : tab === "exact"
-          ? result.func
-          : tab === "contract"
-            ? view.display_contract ?? view.contract
-            : view.display_stdlib ?? view.stdlib
-      : "";
+  const request = useRef<(() => void) | null>(null);
+  useEffect(() => () => request.current?.(), []);
+  const source = result
+    ? tab === "json"
+      ? JSON.stringify(result, null, 2)
+      : tab === "contract"
+        ? (result.display_contract ?? result.contract)
+        : (result.display_stdlib ?? result.stdlib)
+    : "";
 
-  async function decompile() {
-    const controller = new AbortController();
-    request.current = controller;
-    setBusy(true);
+  function decompile() {
+    request.current?.();
+    const raw = code.trim();
     setError("");
-    setResult(null);
     setCopied(false);
-    const timeout = setTimeout(() => controller.abort("timeout"), 40000);
-    try {
-      const response = await fetch("/api/decompile", {
-        method: "POST",
-        cache: "no-store",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: code.trim(), verify }),
-        signal: controller.signal,
-      });
-      const text = await response.text();
-      let data: Result;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new Error(
-          response.status === 413
-            ? "BOC is too large. Maximum size: 1 MiB."
-            : `Server error (${response.status}).`,
-        );
-      }
-      if (!response.ok || !data.success)
-        throw new Error(
-          data.error?.message ?? "Could not reconstruct the contract.",
-        );
-      setResult(data);
-      setTab("contract");
-    } catch (e) {
-      setError(
-        controller.signal.aborted
-          ? controller.signal.reason === "timeout"
-            ? "Request timed out. Try disabling compilation verification."
-            : "Decompilation cancelled."
-          : e instanceof Error
-            ? e.message
-            : "Request failed.",
-      );
-    } finally {
-      clearTimeout(timeout);
-      request.current = null;
+    setTab("contract");
+    const cached = resultCache.get(raw);
+    setResult(cached ?? null);
+    if (cached) {
       setBusy(false);
+      return;
     }
+    setBusy(true);
+    let worker: Worker | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const stop = () => {
+      clearTimeout(timeout);
+      worker?.terminate();
+      request.current = null;
+    };
+    request.current = stop;
+    try {
+      worker = new Worker(
+        new URL("../lib/decompiler.worker.ts", import.meta.url),
+      );
+      worker.onmessage = (event: MessageEvent<DecompilationResponse>) => {
+        stop();
+        setBusy(false);
+        if ("error" in event.data) setError(event.data.error);
+        else {
+          resultCache.set(raw, event.data.result);
+          setResult(event.data.result);
+        }
+      };
+      worker.onerror = worker.onmessageerror = () => {
+        stop();
+        setBusy(false);
+        setError("Unable to run the browser decompiler. Please try again.");
+      };
+      timeout = setTimeout(() => {
+        stop();
+        setBusy(false);
+        setError("Decompilation exceeded the 30-second limit.");
+      }, 30_000);
+      worker.postMessage(raw);
+    } catch (cause) {
+      stop();
+      setBusy(false);
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Unable to start the decompiler.",
+      );
+    }
+  }
+  function cancel() {
+    request.current?.();
+    setBusy(false);
+    setError("Decompilation cancelled.");
   }
   async function copy() {
     try {
@@ -111,7 +100,7 @@ export default function Home() {
   }
   function download() {
     // Contract and helper declarations together make a standalone FunC file.
-    const content = tab === "contract" ? (view?.func ?? source) : source;
+    const content = tab === "contract" ? (result?.func ?? source) : source;
     const url = URL.createObjectURL(
       new Blob([content], { type: "text/plain;charset=utf-8" }),
     );
@@ -146,8 +135,8 @@ export default function Home() {
             <span>Decompiler</span>
           </h1>
           <p>
-            Paste a contract code BOC to reconstruct functions, control flow, and
-            data operations in readable FunC.
+            Paste a contract code BOC to reconstruct functions, control flow,
+            and data operations in readable FunC.
           </p>
         </section>
         <section className={styles.panel} aria-label="Contract input">
@@ -164,22 +153,9 @@ export default function Home() {
             placeholder="te6ccgE…"
           />
           <div className={styles.actions}>
-            <label className={styles.check}>
-              <input
-                type="checkbox"
-                checked={verify}
-                disabled={busy}
-                onChange={(e) => setVerify(e.target.checked)}
-              />
-              <span>
-                Verify by recompiling
-                <small>Disable for static reconstruction only</small>
-              </span>
-            </label>
+            <span className={styles.muted}>Runs locally in your browser</span>
             <div className={styles.buttons}>
-              {busy && (
-                <button onClick={() => request.current?.abort()}>Cancel</button>
-              )}
+              {busy && <button onClick={cancel}>Cancel</button>}
               <button
                 className={styles.primary}
                 disabled={busy || !code.trim()}
@@ -197,37 +173,31 @@ export default function Home() {
         )}
         {busy && (
           <p role="status" className={styles.loading}>
-            Analyzing instructions and reconstructing FunC. Verification may take
-            up to 30 seconds.
+            Analyzing instructions and reconstructing FunC in your browser.
           </p>
         )}
-        {result && view && (
-          <section
-            className={styles.result}
-            aria-label="Decompilation result"
-          >
+        {result && (
+          <section className={styles.result} aria-label="Decompilation result">
             <div className={styles.resultHead}>
               <div>
                 <div className={styles.eyebrow}>RESULT</div>
                 <h2>Reconstructed contract</h2>
               </div>
               <span className={styles.badge}>
-                {shown!.decompilation.structured_method_count} /{" "}
-                {shown!.decompilation.method_count} methods in FunC
-                {!!shown!.decompilation.partial_method_count &&
-                  ` · ${shown!.decompilation.partial_method_count} partial`}
+                {result.decompilation.structured_method_count} /{" "}
+                {result.decompilation.method_count} methods in FunC
+                {!!result.decompilation.partial_method_count &&
+                  ` · ${result.decompilation.partial_method_count} partial`}
               </span>
             </div>
             <p className={styles.notice}>
-              {tab === "contract" && view.display_contract &&
+              {tab === "contract" &&
+                result.display_contract &&
                 "Partial preview: readable prefixes and unresolved TVM instructions. Download saves the complete FunC source with preserved bytecode. "}
-              {shown!.decompilation.exact_hash_match
-                ? "Recompiled successfully. The code hash matches the original."
-                : shown!.decompilation.recompiles
-                  ? "The source compiles, but the code hash differs. Behavioral equivalence has not been established."
-                  : "Static reconstruction. Compilation and behavioral equivalence have not been checked."}
-              {shown!.decompilation.structured_method_count <
-                shown!.decompilation.method_count &&
+              Static reconstruction. Compilation and behavioral equivalence have
+              not been checked.
+              {result.decompilation.structured_method_count <
+                result.decompilation.method_count &&
                 " Some methods are preserved as assembly."}
             </p>
             <div className={styles.toolbar}>
@@ -238,11 +208,13 @@ export default function Home() {
               >
                 {(
                   [
-                    ["contract", view?.display_contract ? "FunC + TVM preview" : "Readable FunC"],
+                    [
+                      "contract",
+                      result.display_contract
+                        ? "FunC + TVM preview"
+                        : "Readable FunC",
+                    ],
                     ["stdlib", "Helpers"],
-                    ...(result.decompilation.exact_hash_match
-                      ? [["exact", "Exact source"]]
-                      : []),
                     ["json", "JSON"],
                   ] as [Tab, string][]
                 ).map(([key, title]) => (
@@ -260,28 +232,26 @@ export default function Home() {
                 ))}
               </div>
               <div className={styles.buttons}>
-                <button onClick={copy}>
-                  {copied ? "Copied" : "Copy"}
+                <button onClick={copy}>{copied ? "Copied" : "Copy"}</button>
+                <button onClick={download}>
+                  {tab === "contract" && result.display_contract
+                    ? "Download FunC ↓"
+                    : "Download ↓"}
                 </button>
-                <button onClick={download}>{tab === "contract" && view.display_contract ? "Download FunC ↓" : "Download ↓"}</button>
               </div>
             </div>
             <pre className={styles.code} role="tabpanel" tabIndex={0}>
-              <code>
-                {source || "// No helper functions required."}
-              </code>
+              <code>{source || "// No helper functions required."}</code>
             </pre>
             <div className={styles.hash}>
               Original code hash{" "}
-              <code>{shown!.decompilation.original_code_hash}</code>
+              <code>{result.decompilation.original_code_hash}</code>
             </div>
           </section>
         )}
         <footer className={styles.footer}>
           <span>Static analysis · no TVM execution</span>
-          <span>
-            API <code>POST /api/decompile</code>
-          </span>
+          <span>Local processing · no BOC upload</span>
         </footer>
       </main>
     </>

@@ -1,5 +1,5 @@
-import { expr, statement, type Expr, type Statement, type Primitive } from './ir.js';
-import type { Module } from './func.js';
+import { expr, statement, type Expr, type Statement, type Primitive } from './ir';
+import type { Module } from './func';
 
 function* expressions(value: Expr): Generator<Expr> {
   yield value;

@@ -1,6 +1,7 @@
-import { createHash } from 'node:crypto';
-import { BocError } from './errors.js';
-export { BocError } from './errors.js';
+import { Buffer } from 'buffer';
+import { sha256_sync } from '@ton/crypto';
+import { BocError } from './errors';
+export { BocError } from './errors';
 export const MAX_BYTES = 1_048_576,
   MAX_CELLS = 16_384,
   MAX_DEPTH = 512;
@@ -18,7 +19,7 @@ export interface Boc {
   codeHash: string;
 }
 export const sha256 = (data: Uint8Array | string): Buffer =>
-  createHash('sha256').update(data).digest();
+  sha256_sync(typeof data === 'string' ? data : Buffer.from(data));
 export function crc32c(data: Uint8Array): Buffer {
   let crc = 0xffffffff;
   for (const byte of data) {

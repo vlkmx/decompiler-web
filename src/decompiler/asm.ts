@@ -1,5 +1,5 @@
-import { AsmError } from './errors.js';
-export { AsmError } from './errors.js';
+import { AsmError } from './errors';
+export { AsmError } from './errors';
 export interface Instruction {
   opcode: string;
   operands: string[];

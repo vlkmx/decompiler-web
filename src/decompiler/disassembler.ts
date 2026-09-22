@@ -1,7 +1,7 @@
 import { Cell, runtime } from '@ton/tasm';
-import { methodCells, parseBoc } from './boc.js';
-import { instruction, formatAsm, type Instruction, type Program } from './asm.js';
-import { AsmError } from './errors.js';
+import { methodCells, parseBoc } from './boc';
+import { instruction, formatAsm, type Instruction, type Program } from './asm';
+import { AsmError } from './errors';
 // TASM's typed decoder retains cells/slices, unlike textual disassembly.
 function convert(items: runtime.Instr[], depth = 0): Instruction[] {
   if (depth > 128) throw new AsmError('Continuation nesting exceeds limit');
