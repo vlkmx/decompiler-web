@@ -13,6 +13,8 @@ Scope: the registry contains 322 Tolk and 1192 FunC packages. This audit is a co
 
 ## Implemented
 
+- A tuple immediately assigned to a global slot inherits an already established structural type for that slot. Unknown input types are constrained; conflicting element types and arities remain unsupported. No global slot numbers or contract hashes are special-cased.
+
 - Dynamic `EXECUTE` followed immediately by `THROW`, including the exact nullable-cell upgrade idiom, can be emitted as one terminal asm helper. Analysis requires the complete entrypoint stack (up to the compiler’s 16-argument asm limit), preserves its order and strips compiler temporaries before execution. No dynamic return signature is invented. Arbitrary result-consuming calls, incomplete caller stacks and legacy catch snapshots that cannot restore c3 still use bytecode fallback. Tolk represents continuation values as opaque `unknown` slots.
 
 - Exact compiler-generated `SETCONTCTR`/`TRY` sequences reconstruct as native FunC and Tolk `try/catch`, including captured stack values, nested handlers and early returns. Both legacy c4/c5/c7 and newer c1/c3/c4/c5/c7 snapshots are recognized. Legacy snapshots with a possible c3 mutation inside the protected block remain assembly. Arbitrary continuation save lists and unresolved exception argument types are not guessed.
@@ -29,11 +31,13 @@ Scope: the registry contains 322 Tolk and 1192 FunC packages. This audit is a co
 
 ## Validation
 
+- The supplied DeDust Jetton Vault v2 (`a30f0486b813dfe55f549fa986272349a96335e1e44e7276d4878c870083306f`) improves from 15/18 to 16/18 methods. Twelve initializer cases compare original and recovered FunC/Tolk return stacks, c4, c5 and globals 2/3/6/7/8 across workchains, versions and explicit/derived minter addresses. The full FunC hybrid compiles; the recovered Tolk methods are tested with an empty test-only entrypoint because Tolk output intentionally omits unsupported methods.
+
 - 117 dynamic-call transaction cases compare exit codes, stored data and action lists in the original and reconstructed FunC/Tolk: direct/nullable calls, full register catch snapshots, 16-slot incoming stacks, argument order and depth, arbitrary return-stack sizes, exceptions, RETALT, c3 updates, RAWRESERVE and COMMIT. Nine cases use the reported pool bytecode and its actual upgrade message/storage format. Gas and bytecode-introspection equivalence are not claimed.
 
 - 126 try/catch differential cases pass for both snapshot formats and both reconstructed languages: 123 getter cases compare stacks and exit codes; three internal-message cases compare persistent data and action lists on success and caught failure.
 
-- 47 unit/regression tests pass.
+- 50 unit/regression tests pass.
 - 147 differential input cases each run against original FunC bytecode and reconstructed FunC and Tolk: empty/populated dictionaries, missing-key exceptions, WHILE zero/multiple iterations and transformed exit stacks, signed shifted division, division by zero, slices with references and underflow errors. Compare serialized result-stack hashes and exit codes.
 - 73 additional differential cases for typed helper calls, both branches, nullable cells, repeat loops with zero/multiple iterations, slice run lengths from empty through 1023 bits, retained references, invalid bit arguments and null-to-slice exceptions. Both output languages match original bytecode.
 - 199 additional differential cases cover shared polymorphic helpers, transitive calls, branch selection, nullable returns, repeat/while zero-iteration paths, until loops, cell/slice/tuple/integer arguments, downstream type constraints and exception codes. Original bytecode is compared with both reconstructed languages, including direct calls to generic method IDs with heterogeneous TVM values.
@@ -43,6 +47,8 @@ Scope: the registry contains 322 Tolk and 1192 FunC packages. This audit is a co
 - Compilation does not prove arbitrary-input equivalence. Gas, internal-message paths and full-contract behavior have not been differentially verified across the corpus.
 
 ## Remaining work
+
+DeDust methods 0 and 134 still require bytecode fallback: upgrade handler 134 installs message-supplied code into c3 and calls method 43092 in that new dispatcher. The old contract’s empty method 43092 cannot establish the new implementation’s stack signature. The caller method 0 inherits that blocker. This returning dynamic call is outside the supported EXECUTE/THROW terminal idiom.
 
 The reported pool (`192535677eed65c20ac387efe4dd7415ad9ebb9349103e87c60e592538c9dcf3`) now reconstructs 26/26 methods and recompiles in both FunC and Tolk. Its dynamic upgrade tail remains an explicit asm helper; the runtime-supplied payload itself is not statically reconstructed. Recovering method 0 also establishes the tuple types needed by methods 71/72. This fixture is additional to the saved corpus counts above.
 
@@ -1696,4 +1702,10 @@ Terminal dynamic execution regression, including the reported pool:
 
 ```sh
 FUNC_COMPILER=/tmp/tolk-corpus-check/node_modules/@ton-community/func-js TOLK_COMPILER=/tmp/tolk-corpus-check/node_modules/tolk-1.4.2 TVM_SANDBOX=/tmp/tolk-corpus-check/node_modules/@ton/sandbox node --import ./tests/register.mjs tests/dynamic-execute-vm.mjs
+```
+
+DeDust initializer regression:
+
+```sh
+FUNC_COMPILER=/tmp/tolk-corpus-check/node_modules/@ton-community/func-js TOLK_COMPILER=/tmp/tolk-corpus-check/node_modules/tolk-1.4.2 TVM_SANDBOX=/tmp/tolk-corpus-check/node_modules/@ton/sandbox node --import ./tests/register.mjs tests/dedust-vm.mjs
 ```

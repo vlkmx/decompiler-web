@@ -925,7 +925,14 @@ export function analyze(
       }
       if ((op === 'CALL' && i.blocks.length === 1) || op === 'EXECUTE') {
         const continuation = op === 'CALL' ? i.blocks[0] : pending.pop();
-        if (!continuation) throw new UnsupportedInstruction(op, 'Dynamic continuation: runtime code and stack signature are unknown');
+        if (!continuation) {
+          const pushed = code[index - 1], target = code[index - 2];
+          if (changesC3 && pushed?.opcode === 'PUSH' && pushed.operands[0] === 'c3' &&
+              target?.opcode === 'PUSHINT')
+            throw new UnsupportedInstruction(op,
+              `Method ${target.operands[0]} runs in runtime-supplied code; its stack signature is unknown`);
+          throw new UnsupportedInstruction(op, 'Dynamic continuation: runtime code and stack signature are unknown');
+        }
         const r = execute(continuation, stack, depth + 1, true);
         body.push(...r.body);
         if (r.terminal) return { body, terminal: true };
@@ -1279,8 +1286,18 @@ export function analyze(
           primitive('VECTOR_EMPTY', [], ['vector_empty'], '0 TUPLE');
           continue;
         }
-        const values = take(n),
-          types = values.map((v) => v.type);
+        const values = take(n);
+        // A known global tuple shape constrains a tuple assigned directly to
+        // that slot, including inputs whose types have not yet been inferred.
+        const assignment = code[index + 1];
+        const assignedType = assignment?.opcode === 'SETGLOB' && assignment.operands.length === 1
+          ? globalTypes.get(Number(assignment.operands[0])) : undefined;
+        if (assignedType?.startsWith('[')) {
+          const expected = tupleTypes(assignedType);
+          if (expected.length !== n) throw new UnsupportedInstruction('type', 'Global tuple arity differs');
+          values.forEach((value, k) => requireType(value, expected[k]));
+        }
+        const types = values.map((v) => v.type);
         if (types.some((t) => t === 'unknown'))
           throw new UnsupportedInstruction(op, 'Unknown tuple element types');
         if (n === 2 && (types[1] === 'null' || types[1] === 'list_' + types[0])) {
