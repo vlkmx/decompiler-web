@@ -6,7 +6,7 @@ import { formatAsm, type Program } from './asm';
 function typeName(type: string): string {
   if (type === '()') return 'void';
   if (type === 'null') return 'null';
-  if (type === 'unknown') return 'unknown';
+  if (type === 'unknown' || type === 'cont') return 'unknown';
   if (type.startsWith('[')) return `[${tupleTypes(type).map(typeName).join(', ')}]`;
   if (/^(vector_|list_)/.test(type)) return 'tuple';
   return type;
@@ -49,6 +49,14 @@ function statements(body: Statement[], level = 4, genericCalls = new Set<string>
     else if (s.kind === 'set') out.push(`${pad}${v[0]} = ${v[1]};`);
     else if (s.kind === 'call') out.push(`${pad}${v[0]};`);
     else if (s.kind === 'return') out.push(`${pad}return${v.length ? ' ' + (v.length === 1 ? v[0] : `(${v.join(', ')})`) : ''};`);
+    else if (s.kind === 'try') {
+      const arg = s.values[0];
+      const binding = arg.type === 'unknown' ? v[0] : `${v[0]}_raw`;
+      out.push(`${pad}try {`, ...statements(s.then, level + 4, genericCalls),
+        `${pad}} catch (${v[1]}, ${binding}) {`);
+      if (arg.type !== 'unknown') out.push(`${pad}    var ${v[0]} = ${binding} as ${typeName(arg.type)};`);
+      out.push(...statements(s.otherwise, level + 4, genericCalls), `${pad}}`);
+    }
     else if (s.kind === 'throw') out.push(`${pad}throw ${v[0]};`);
     else if (s.kind === 'throwif' || s.kind === 'throwifnot')
       out.push(`${pad}if (${v[1]} ${s.kind === 'throwif' ? '!=' : '=='} 0) { throw ${v[0]}; }`);
@@ -68,7 +76,7 @@ function terminates(body: Statement[]): boolean {
   const last = body.at(-1);
   return !!last && (['return', 'throw'].includes(last.kind) ||
     (last.kind === 'while' && last.values[0]?.op === 'literal' && BigInt(last.values[0].value) !== 0n) ||
-    (last.kind === 'if' && terminates(last.then) && terminates(last.otherwise)));
+    (['if', 'try'].includes(last.kind) && terminates(last.then) && terminates(last.otherwise)));
 }
 function generics(types: string[]): string {
   const names = [...new Set(types.flatMap(t => t.match(/\bX\d*\b/g) ?? []))];

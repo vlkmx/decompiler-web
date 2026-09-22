@@ -13,6 +13,7 @@ import {
   type PartialIR,
 } from './ir';
 import { UnsupportedInstruction } from './errors';
+import { matchTryCatch } from './patterns';
 export interface FunctionAst {
   id: number;
   name: string;
@@ -67,7 +68,21 @@ export function fallbackCells(program: Program, cells: Map<number, Buffer>): Mod
 }
 export function reconstruct(program: Program, cells?: Map<number, Buffer>): Module {
   checkDispatcher(program);
-  const stableDispatcher = ![...program.methods.values()]
+  const foldTry = (code: Instruction[]): Instruction[] => {
+    const result: Instruction[] = [];
+    for (let n = 0; n < code.length; n++) {
+      const match = matchTryCatch(code, n);
+      if (match) {
+        result.push(instruction('TRY_CATCH', [String(match.captured), match.savesC3 ? '1' : '0'],
+          [foldTry(match.body), foldTry(match.handler)]));
+        n += match.length - 1;
+      } else result.push({ ...code[n], blocks: code[n].blocks.map(foldTry) });
+    }
+    return result;
+  };
+  const foldedMethods = new Map([...program.methods].sort(([a], [b]) => a - b)
+    .map(([id, code]) => [id, foldTry(code)]));
+  const stableDispatcher = ![...foldedMethods.values()]
     .flatMap((code) => [...walk(code)])
     .some(
       (i) =>
@@ -120,7 +135,7 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
     }
     return result;
   }
-  const methods = new Map([...program.methods].sort(([a], [b]) => a - b)
+  const methods = new Map([...foldedMethods]
     .map(([id, code]) => [id, staticCalls(code)]));
   for (const [id, code] of helperCode) methods.set(id, code);
   const irs = new Map<number, StackIR>(),
@@ -178,7 +193,7 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
         const loopReturn = (body: Statement[]): boolean =>
           body.some(
             (s) =>
-              (['while', 'until', 'repeat'].includes(s.kind) && hasReturn(s.then)) ||
+              (['while', 'until', 'repeat', 'try'].includes(s.kind) && hasReturn([s])) ||
               loopReturn(s.then) ||
               loopReturn(s.otherwise),
           );
@@ -258,7 +273,7 @@ export function reconstruct(program: Program, cells?: Map<number, Buffer>): Modu
     Number(called.has(a)) - Number(called.has(b)) || a - b);
   const snapshot = () => JSON.stringify([
     [...irs].sort(([a], [b]) => a - b).map(([id, ir]) =>
-      [id, ir.argumentTypes, ir.returns.map(v => v.type)]),
+      [id, ir.argumentTypes, ir.returns.map(v => v.type), ir.changesC3]),
     [...globalTypes].sort(([a], [b]) => a - b),
     [...shapeHints].sort(([a], [b]) => a - b),
     [...failures].sort(([a], [b]) => a - b).map(([id, e]) => [id, e.opcode, e.message]),
@@ -466,6 +481,9 @@ function statements(body: Statement[], level = 2): string[] {
     else if (s.kind === 'set') out.push(`${pad}${v[0]} = ${v[1]};`);
     else if (s.kind === 'call') out.push(`${pad}${v[0]};`);
     else if (s.kind === 'return') out.push(`${pad}return (${v.join(', ')});`);
+    else if (s.kind === 'try')
+      out.push(`${pad}try {`, ...statements(s.then, level + 2),
+        `${pad}} catch (${v[0]}, ${v[1]}) {`, ...statements(s.otherwise, level + 2), `${pad}}`);
     else if (['throw', 'throwif', 'throwifnot'].includes(s.kind))
       out.push(
         `${pad}${{ throw: 'throw', throwif: 'throw_if', throwifnot: 'throw_unless' }[s.kind]}(${v.join(', ')});`,
@@ -519,7 +537,7 @@ function terminates(body: Statement[]): boolean {
   const last = body.at(-1);
   return !!last && (
     last.kind === 'throw' || last.kind === 'return' ||
-    (last.kind === 'if' && terminates(last.then) && terminates(last.otherwise))
+    (['if', 'try'].includes(last.kind) && terminates(last.then) && terminates(last.otherwise))
   );
 }
 export function renderParts(

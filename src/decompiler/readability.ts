@@ -26,6 +26,10 @@ function uses(body: Statement[]) {
   const count = (body: Statement[]) => {
     for (const s of body) {
       let values = s.values;
+      if (s.kind === 'try') {
+        values.forEach(v => add(writes, v));
+        values = [];
+      }
       if (['assign', 'set', 'declare'].includes(s.kind)) {
         add(writes, values[0]);
         values = values.slice(1);

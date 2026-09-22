@@ -67,7 +67,7 @@ function convert(items: runtime.Instr[], depth = 0): Instruction[] {
     if (name === 'PUSHCTR' || name === 'POPCTR') {
       name = name.slice(0, -3);
       operands[0] = 'c' + operands[0];
-    } else if (name === 'SAVECTR') operands[0] = 'c' + operands[0];
+    } else if (name === 'SAVECTR' || name === 'SETCONTCTR') operands[0] = 'c' + operands[0];
     else if (
       [
         'PUSH',

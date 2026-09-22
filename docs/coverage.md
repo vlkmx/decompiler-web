@@ -5,13 +5,17 @@ These are structured-reconstruction counts, not a proof of semantic equivalence.
 | Source corpus | Hash-verified BOCs | Parsed contracts | Structured methods | Fully structured contracts |
 |---|---:|---:|---:|---:|
 | Tolk 1.4.2 | 39 | 38 | 378 / 427 (88.5%) | 29 |
-| FunC 0.4.6 | 193 | 192 | 1945 / 3187 (61.0%) | 142 |
+| FunC 0.4.6 | 193 | 192 | 1950 / 3187 (61.2%) | 145 |
 
 Tolk originally had 101/427 in the saved baseline; the previous reported checkpoint was 330/427. FunC had 1792/3187 immediately before this audit. The opcode/caller-hint pass added 14 Tolk methods and 26 FunC methods relative to the 363/1919 checkpoint. The signature-inference pass adds one more Tolk method (Doom: 10/24), with FunC unchanged at 1945/3187. No per-contract coverage regression against the saved baselines or the 363/1919 and 377/1945 checkpoints; parsed-contract and method denominators are unchanged.
 
 Scope: the registry contains 322 Tolk and 1192 FunC packages. This audit is a compiler-version subset, not every registry contract. Of 209 FunC 0.4.6 source packages attempted, 193 compiled to the exact registry hash and 16 failed source compilation (including incomplete bundles / helper-only entrypoints). One BOC in each language corpus could not be disassembled; these are excluded from method denominators, not counted as recovered.
 
 ## Implemented
+
+- Dynamic `EXECUTE` followed immediately by `THROW`, including the exact nullable-cell upgrade idiom, can be emitted as one terminal asm helper. Analysis requires the complete entrypoint stack (up to the compiler’s 16-argument asm limit), preserves its order and strips compiler temporaries before execution. No dynamic return signature is invented. Arbitrary result-consuming calls, incomplete caller stacks and legacy catch snapshots that cannot restore c3 still use bytecode fallback. Tolk represents continuation values as opaque `unknown` slots.
+
+- Exact compiler-generated `SETCONTCTR`/`TRY` sequences reconstruct as native FunC and Tolk `try/catch`, including captured stack values, nested handlers and early returns. Both legacy c4/c5/c7 and newer c1/c3/c4/c5/c7 snapshots are recognized. Legacy snapshots with a possible c3 mutation inside the protected block remain assembly. Arbitrary continuation save lists and unresolved exception argument types are not guessed.
 
 - Parametric one-slot signatures preserve input/output type relationships through chains of calls, branches, nullable returns and loop state. Each call instantiates its own type variables; downstream uses constrain the corresponding caller inputs without mutating the callee. Conflicting concrete constraints are still rejected.
 - Method discovery rebuilds successful and failed IR until signatures, global constraints and structural tuple hints stabilize. Method/helper discovery uses canonical ID order. Unknown recursive arities are never guessed; non-convergence retains bytecode fallbacks.
@@ -25,18 +29,26 @@ Scope: the registry contains 322 Tolk and 1192 FunC packages. This audit is a co
 
 ## Validation
 
-- 37 unit/regression tests pass.
+- 117 dynamic-call transaction cases compare exit codes, stored data and action lists in the original and reconstructed FunC/Tolk: direct/nullable calls, full register catch snapshots, 16-slot incoming stacks, argument order and depth, arbitrary return-stack sizes, exceptions, RETALT, c3 updates, RAWRESERVE and COMMIT. Nine cases use the reported pool bytecode and its actual upgrade message/storage format. Gas and bytecode-introspection equivalence are not claimed.
+
+- 126 try/catch differential cases pass for both snapshot formats and both reconstructed languages: 123 getter cases compare stacks and exit codes; three internal-message cases compare persistent data and action lists on success and caught failure.
+
+- 47 unit/regression tests pass.
 - 147 differential input cases each run against original FunC bytecode and reconstructed FunC and Tolk: empty/populated dictionaries, missing-key exceptions, WHILE zero/multiple iterations and transformed exit stacks, signed shifted division, division by zero, slices with references and underflow errors. Compare serialized result-stack hashes and exit codes.
 - 73 additional differential cases for typed helper calls, both branches, nullable cells, repeat loops with zero/multiple iterations, slice run lengths from empty through 1023 bits, retained references, invalid bit arguments and null-to-slice exceptions. Both output languages match original bytecode.
 - 199 additional differential cases cover shared polymorphic helpers, transitive calls, branch selection, nullable returns, repeat/while zero-iteration paths, until loops, cell/slice/tuple/integer arguments, downstream type constraints and exception codes. Original bytecode is compared with both reconstructed languages, including direct calls to generic method IDs with heterogeneous TVM values.
 - All 230 parsed contracts (38 Tolk + 192 FunC) preserve identical IR, signatures, diagnostics and both rendered outputs when the method map is reversed. The regression fixture also checks rotated method order.
 - Existing DeskCollection test: 64 differential getter cases.
-- All 29 fully structured Tolk contracts recompile with Tolk 1.4.2; all 142 fully structured FunC contracts recompile with FunC 0.4.6.
+- All 29 fully structured Tolk contracts recompile with Tolk 1.4.2; all 145 fully structured FunC contracts recompile with FunC 0.4.6.
 - Compilation does not prove arbitrary-input equivalence. Gas, internal-message paths and full-contract behavior have not been differentially verified across the corpus.
 
 ## Remaining work
 
+The reported pool (`192535677eed65c20ac387efe4dd7415ad9ebb9349103e87c60e592538c9dcf3`) now reconstructs 26/26 methods and recompiles in both FunC and Tolk. Its dynamic upgrade tail remains an explicit asm helper; the runtime-supplied payload itself is not statically reconstructed. Recovering method 0 also establishes the tuple types needed by methods 71/72. This fixture is additional to the saved corpus counts above.
+
 Parametric signatures handle one-slot polymorphism, but type conflicts still need better inference for structural tuples, globals and recursive calls; they are analyzer limitations, not evidence of invalid original contracts. Dynamic continuations (EXECUTE/CALLXARGS), recursive/unknown-signature CALLDICT calls, generic tuples and variable indexes need deeper control-flow/type analysis. Quiet dictionary operations without explicit padding need path-sensitive stack shapes. Debug operations and remaining fixed-signature opcodes are smaller additions, but must preserve their unusual stack behavior. Exotic cells need disassembler support.
+
+The try/catch pass adds five FunC methods and three fully structured contracts relative to 1945/3187 and 142. Tolk coverage is unchanged.
 
 ## Tolk remaining gaps
 
@@ -162,10 +174,9 @@ Counts below are contracts encountering each first blocking instruction/category
 | `STRDUMP` | 16 |
 | `type` | 16 |
 | `return` | 15 |
-| `CALLXARGS` | 13 |
+| `CALLXARGS` | 14 |
 | `HASHEXT` | 12 |
 | `TPUSH` | 10 |
-| `register` | 8 |
 | `DICTGET` | 7 |
 | `DUMP` | 4 |
 | `GETGLOB` | 4 |
@@ -318,12 +329,11 @@ Code hash: `278305009817507812564d9c24680464e63300e88cd77eba976ff69bad9fe35d`
 - Method 124317: Dictionary lookup needs padding or immediate success assertion
 - Method 130054: Dictionary lookup needs padding or immediate success assertion
 
-### fluida.fc — 6/9
+### fluida.fc — 7/9
 
 Code hash: `27f4b37fa64afa058cdfc9bedfdb8905c0012371393573d522f7fb1f3e935728`
 
 - Method 0: Unsupported instruction: CALLXARGS
-- Method 9: Unsupported instruction: register
 - Method 10: Unsupported instruction: CALLXARGS
 
 ### src/protocol/msglibs/ultralightnode/uln/main.fc — 47/117
@@ -693,7 +703,7 @@ Code hash: `6cb8d8ab5d95fb424c23c5a8d170bfd99235ba52468416a0b2b7b73af6301019`
 
 Code hash: `6d456903c694bef806e85c7edf0c2c0337408c2048113a778de1d1e34dc9ee63`
 
-- Method 0: Unsupported instruction: register
+- Method 0: Recursive method signature
 - Method 5: Recursive method signature
 
 ### src/BamOFT/main.fc — 63/155
@@ -800,12 +810,6 @@ Code hash: `7de4a30bc4f4072b84a4a383238ae49fecc3a3d455fe7c9898578f8080ea0527`
 - Method 5: Unknown vector element type
 - Method 6: Unknown tuple element types
 - Method 68445: Unknown tuple element types
-
-### nft-auction-v4r1.func — 3/4
-
-Code hash: `80e3c419d72d5c12df01ad2c6564725c3fac328f40ad4311cd4dbf7b83c53fc5`
-
-- Method 0: Unsupported instruction: register
 
 ### main.fc — 2/10
 
@@ -1148,7 +1152,7 @@ Code hash: `9bbbf539fed4d953a814d58d438b810302216e643a72025f63dbe12c0844cbbe`
 
 Code hash: `9e2a43eba062ffe17099f6f8ced2fa97945d114a75ad5002cd291823d83bce95`
 
-- Method 0: Unsupported instruction: register
+- Method 0: Recursive method signature
 - Method 5: Recursive method signature
 
 ### src/BamOFT/main.fc — 63/155
@@ -1291,13 +1295,12 @@ Code hash: `b18c5fa6450ac5240f84b1cfe5c434175a5c5386dd351e4f744955945a595808`
 
 - Method 0: Unsupported instruction: DUMP
 
-### fluida.fc — 6/10
+### fluida.fc — 7/10
 
 Code hash: `ba30cd7b928696f9bf0a194a9e1befe13fc3e44d56bc643214fd24ac22ccf42d`
 
 - Method 0: Unsupported instruction: CALLXARGS
 - Method 9: Unsupported instruction: CALLXARGS
-- Method 10: Unsupported instruction: register
 - Method 11: Unsupported instruction: CALLXARGS
 
 ### contract.fc — 0/4
@@ -1547,18 +1550,6 @@ Code hash: `c4e6f180c26e54ed7b597ae0b3eee5826aab7deaf13c3b2dd751ec898d3fd00a`
 - Method 129212: Unknown tuple element types
 - Method 130676: Unknown tuple element types
 
-### vesting_wallet.fc — 8/9
-
-Code hash: `cc5333a6fd7edc1a72dd1c3e8cbc3bc5560daf2c2787e201fe105eb8c64e7f98`
-
-- Method -1: Unsupported instruction: register
-
-### nft-auction-v4r1.func — 3/4
-
-Code hash: `ce5a78534eaaa6ceed8dafd486d076eb60a9b0d6dbfb53676f662649c0689956`
-
-- Method 0: Unsupported instruction: register
-
 ### main.fc — 2/8
 
 Code hash: `d2752443e677bb667da22cd29ff1160dd9010062c9b5141f4c19fb7f84e386b6`
@@ -1582,7 +1573,7 @@ Code hash: `d4038ab95b1b24c4fb3da62f2facfc35367fa85e71e85e4a3bb2266713164276`
 
 Code hash: `d46e6044dac9902cd0d92197933aa658ee9b5b646e8062841edb77ff9a437c61`
 
-- Method 0: Unsupported instruction: register
+- Method 0: Unsupported instruction: CALLXARGS
 
 ### main.fc — 2/8
 
@@ -1694,3 +1685,15 @@ node --import ./tests/register.mjs tests/check-corpus-order.mjs ../tolk-benchmar
 ```
 
 Opcode signatures were checked against the [official TVM specification](https://docs.ton.org/tvm.pdf) and [upstream assembler definitions](https://github.com/ton-blockchain/ton/blob/master/crypto/fift/lib/Asm.fif).
+
+Try/catch regression with both compiler snapshot formats:
+
+```sh
+FUNC_COMPILER=/tmp/tolk-corpus-check/node_modules/@ton-community/func-js TOLK_COMPILER=/tmp/tolk-corpus-check/node_modules/tolk-1.4.2 TVM_SANDBOX=/tmp/tolk-corpus-check/node_modules/@ton/sandbox node --import ./tests/register.mjs tests/try-catch-vm.mjs
+```
+
+Terminal dynamic execution regression, including the reported pool:
+
+```sh
+FUNC_COMPILER=/tmp/tolk-corpus-check/node_modules/@ton-community/func-js TOLK_COMPILER=/tmp/tolk-corpus-check/node_modules/tolk-1.4.2 TVM_SANDBOX=/tmp/tolk-corpus-check/node_modules/@ton/sandbox node --import ./tests/register.mjs tests/dynamic-execute-vm.mjs
+```

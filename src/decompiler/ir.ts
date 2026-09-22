@@ -5,7 +5,7 @@ import { instruction, type Instruction } from './asm';
 import { UnsupportedInstruction } from './errors';
 import { primitiveSignatures } from './primitives';
 import { parseBoc } from './boc';
-import { isDecimalDigitLoop, isDecimalConversion } from './patterns';
+import { isDecimalDigitLoop, isDecimalConversion, matchTryCatch, matchTerminalExecute } from './patterns';
 export { UnsupportedInstruction } from './errors';
 export interface Expr {
   op: string;
@@ -26,6 +26,7 @@ export interface Primitive {
   assembly: string;
 }
 export interface StackIR {
+  changesC3?: boolean;
   inlineBody?: boolean;
   arguments: number;
   argumentTypes: string[];
@@ -141,6 +142,7 @@ export function analyze(
   const primitives = new Map<string, Primitive>();
   let localCount = 0,
     steps = 0;
+  let changesC3 = false, restrictedC3Depth = 0;
   const local = (type: string) => expr('local', `v${localCount++}`, type);
   // A generic call result and its corresponding input share a type constraint,
   // not a value. Keep that relationship until all uses have been analyzed.
@@ -285,7 +287,8 @@ export function analyze(
       assembly = op,
       suffix = '',
     ): void {
-      const operands = take(inputs.length);
+      const operands = take(inputs.length).map((v, n) => v.type === 'null' && /^X\d*$/.test(inputs[n])
+        ? { ...v, type: 'unknown' } : v);
       operands.forEach((v, i) => requireType(v, inputs[i]));
       const name = 'tvm_' + op.toLowerCase().replace(/[^a-z0-9]/g, '_') + suffix;
       primitives.set(name, { name, inputs, outputs, assembly });
@@ -327,6 +330,81 @@ export function analyze(
           return Number(m[1] ?? m[2]);
         });
       if (op === 'NOP') continue;
+      const dynamicExit = !pending.length && matchTerminalExecute(code, index);
+      if (dynamicExit) {
+        // EXECUTE can inspect every stack slot. Minimal inferred arity is not
+        // sufficient: only an entrypoint with a known complete stack qualifies.
+        if (!options.hints) throw new UnsupportedInstruction('EXECUTE', 'Dynamic tail needs a complete entrypoint stack');
+        if (count < options.hints.length) throw new StackUnderflow();
+        if (restrictedC3Depth) throw new UnsupportedInstruction('TRY', 'Dynamic call may change c3 outside catch snapshot');
+        if (!stack.length) throw new StackUnderflow();
+        requireType(stack.at(-1)!, dynamicExit.nullable ? 'cell' : 'cont');
+        const width = stack.length;
+        if (width > 16) throw new UnsupportedInstruction('EXECUTE', 'Dynamic tail stack exceeds the 16-argument asm limit');
+        changesC3 = true;
+        primitive('EXECUTE_TERMINAL', stack.map((_, n) => n === width - 1
+          ? dynamicExit.nullable ? 'cell' : 'cont' : `X${n}`), [],
+          // The compiler may retain temporaries below the explicit arguments.
+          // Move only the modeled stack into a tuple, remove that hidden prefix,
+          // then restore the exact original stack before entering runtime code.
+          `${width} PUSHINT TUPLEVAR DEPTH DEC <{ NIP }>CONT REPEAT ${width} PUSHINT UNTUPLEVAR ` +
+          `${dynamicExit.nullable ? 'DUP ISNULL <{ DROP }>CONT <{ CTOS BLESS EXECUTE }>CONT IFELSE' : 'EXECUTE'} ${dynamicExit.exit} THROW`,
+          `_${dynamicExit.nullable ? 'optional' : 'direct'}_${width}_${dynamicExit.exit}`);
+        // Make the terminal edge explicit to the source compiler as well, so
+        // values needed only by sibling branches are not retained below inputs.
+        body.push(statement('throw', [literal(dynamicExit.exit)]));
+        return { body, terminal: true };
+      }
+      const transactional = pending.length ? undefined : op === 'TRY_CATCH' && i.blocks.length === 2
+        && i.operands.length === 2 && /^\d+$/.test(i.operands[0]) && Number(i.operands[0]) <= 255
+        && ['0', '1'].includes(i.operands[1])
+        ? { length: 1, captured: Number(i.operands[0]), savesC3: i.operands[1] === '1', body: i.blocks[0], handler: i.blocks[1] }
+        : op === 'PUSH' ? matchTryCatch(code, index) : undefined;
+      if (transactional) {
+        const captured = take(transactional.captured);
+        const success = [...stack];
+        const exceptionArg = local('unknown'), exceptionCode = local('int');
+        group(exceptionArg);
+        const failure = [...captured, exceptionArg, exceptionCode];
+        let a: ReturnType<typeof execute>;
+        if (!transactional.savesC3) restrictedC3Depth++;
+        try { a = execute(transactional.body, success, depth + 1, true); }
+        finally { if (!transactional.savesC3) restrictedC3Depth--; }
+        const b = execute(transactional.handler, failure, depth + 1, true);
+        // Unconstrained exception arguments may be any TVM slot. Keep them
+        // opaque when unused; escaping unconstrained values need union types.
+        if (exceptionArg.type === 'unknown') {
+          const escaped = [...success, ...failure].some(v => group(v) === group(exceptionArg));
+          if (escaped) throw new UnsupportedInstruction('TRY', 'Unconstrained exception argument escapes catch');
+          bindType(exceptionArg, 'int');
+        }
+        const exits = [!a.terminal ? success : undefined, !b.terminal ? failure : undefined]
+          .filter((v): v is Expr[] => v !== undefined);
+        if (exits.length === 2 && exits[0].length !== exits[1].length)
+          throw new UnsupportedInstruction('TRY', 'Try and catch stack heights differ');
+        const targets = (exits[0] ?? []).map((value, k) => {
+          const other = exits[1]?.[k];
+          const kind = ['null', 'unknown', 'vector_empty'].includes(value.type) && other
+            ? other.type : value.type;
+          if (other) { requireType(value, kind); requireType(other, kind); }
+          const target = local(kind === 'null' ? 'cell' : kind);
+          if (kind === 'unknown') {
+            unifyTypes(target, value.type === 'unknown' ? value : other!);
+            if (other) unifyTypes(target, other);
+          }
+          body.push(statement('declare', [target]));
+          return target;
+        });
+        if (targets.length) {
+          if (!a.terminal) a.body.push(statement('set', [product(targets), product(success)]));
+          if (!b.terminal) b.body.push(statement('set', [product(targets), product(failure)]));
+        }
+        body.push(statement('try', [exceptionArg, exceptionCode], a.body, b.body));
+        stack.splice(0, stack.length, ...targets);
+        index += transactional.length - 1;
+        if (!exits.length) return { body, terminal: true };
+        continue;
+      }
       if (op === 'PREPAREDICT' && /^CALLXARGS(?:_1)?$/.test(code[index + 1]?.opcode ?? '')) {
         if (pending.length) throw new UnsupportedInstruction(op, 'Mixed static and dynamic continuations');
         const [passed, returned] = code[index + 1].operands.map(Number);
@@ -335,6 +413,8 @@ export function analyze(
         if (!Number.isInteger(passed) || passed < 1 || passed > 15 || returned !== 0)
           throw new UnsupportedInstruction(op, 'Continuation call has an unresolved return signature');
         const id = number();
+        if (restrictedC3Depth) throw new UnsupportedInstruction('TRY', 'Dynamic call may change c3 outside catch snapshot');
+        changesC3 = true;
         primitive('CALL_PREPARED', Array.from({ length: passed - 1 }, (_, n) => `X${n}`), [],
           `${id} PREPAREDICT ${passed} 0 CALLXARGS`, `_${id}_${passed}`);
         index++;
@@ -344,6 +424,8 @@ export function analyze(
         const [passed, returned] = i.operands.map(Number);
         if (!Number.isInteger(passed) || passed < 0 || passed > 15 || returned !== 0)
           throw new UnsupportedInstruction(op, 'Continuation call has an unresolved return signature');
+        if (restrictedC3Depth) throw new UnsupportedInstruction('TRY', 'Dynamic call may change c3 outside catch snapshot');
+        changesC3 = true;
         primitive('CALL_CONTINUATION', [...Array.from({ length: passed }, (_, n) => `X${n}`), 'cont'], [],
           `${passed} 0 CALLXARGS`, `_${passed}`);
         continue;
@@ -354,6 +436,10 @@ export function analyze(
         continue;
       }
       if ((op === 'PUSH' || op === 'POP') && i.operands[0] === 'c3') {
+        if (op === 'POP') {
+          if (restrictedC3Depth) throw new UnsupportedInstruction('TRY', 'Catch snapshot does not restore changed c3');
+          changesC3 = true;
+        }
         if (pending.length) throw new UnsupportedInstruction(op, 'Mixed static and dynamic continuations');
         primitive(op === 'PUSH' ? 'GETC3' : 'SETC3', op === 'POP' ? ['cont'] : [],
           op === 'PUSH' ? ['cont'] : [], `c3 ${op}`);
@@ -853,6 +939,10 @@ export function analyze(
               : options.methods?.get(id);
         if (!callee)
           throw new UnsupportedInstruction(op, `Unknown or recursive method signature: ${id}`);
+        if (callee.changesC3) {
+          if (restrictedC3Depth) throw new UnsupportedInstruction('TRY', 'Callee changes c3 outside catch snapshot');
+          changesC3 = true;
+        }
         const values = take(callee.arguments);
         values.forEach((v, j) => requireType(v, callee.argumentTypes[j]));
         const bindings = new Map<string, Expr>();
@@ -1435,6 +1525,7 @@ export function analyze(
     if (value.type === 'unknown') bindType(value, 'cell');
   });
   return {
+    changesC3,
     arguments: count,
     argumentTypes: args.map((a) => a.type),
     returns,
